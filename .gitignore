@@ -1,0 +1,74 @@
+# Build results
+**/[Bb]in/
+**/[Dd]ebug*/
+**/[Rr]elease*/
+**/obj/
+
+# User-specific files
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+
+# VS Code settings
+**/.vscode/
+
+# Visual Studio
+**/.vs/
+**/*.VC.db
+**/*.VC.VC.opendb
+
+# C++ build artifacts
+**/*.obj
+**/*.exe
+**/*.dll
+**/*.lib
+**/*.exp
+**/*.pdb
+**/*.idb
+**/*.ipch
+**/*.aps
+**/*.ncb
+**/*.sdf
+**/*.opensdf
+**/*.tlog
+**/*.log
+**/*.pch
+**/*.bsc
+**/*.sbr
+**/*.tlh
+**/*.tli
+**/*.cache
+**/*.ilk
+**/*.iobj
+**/*.ipdb
+**/*.rsp
+**/*.trg
+**/*.map
+**/*.suo
+**/*.sln.docstates
+
+# C# build artifacts
+**/*.dll
+**/*.exe
+**/*.pdb
+**/*.cache
+**/*.mdb
+**/*.log
+**/*.vspscc
+**/*.vssscc
+**/*.dbmdl
+**/*.bak
+**/*.backup
+**/*.swp
+**/*.tmp
+
+# NuGet
+**/*.nupkg
+**/*.snupkg
+**/project.lock.json
+**/project.fragment.lock.json
+**/artifacts/
+**/packages/
+**/_ReSharper*/
+**/*.[Rr]e[Ss]harper*/
