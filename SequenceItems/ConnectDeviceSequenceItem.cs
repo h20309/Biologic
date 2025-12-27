@@ -31,7 +31,7 @@ public class ConnectDeviceSequenceItem : SequenceItem
       // Open device (this will open communication and initialize)
       ecLabDevice.Open();
 
-      // Check if connection succeeded
+      // Check if connection and initialization succeeded
       bool isOpen = ecLabDevice.GetProperty("IsOpen") is bool open && open;
       if (!isOpen)
       {
@@ -40,10 +40,21 @@ public class ConnectDeviceSequenceItem : SequenceItem
         return Sequence.ResultTypes.Error;
       }
 
-      Log.Information("Successfully connected to ECLab device");
+      // Verify that we have at least one channel available (firmware loaded successfully)
+      int channelCount = ecLabDevice.GetProperty("ChannelCount") is int count ? count : 0;
+      if (channelCount == 0)
+      {
+        Log.Error("No channels available - firmware loading may have failed");
+        DeviceControlSoftware.MethodParameters.ResultData failure = new(false, "Device connected but no channels available (firmware loading failed)");
+        context.ResultParameter = failure;
+        return Sequence.ResultTypes.Error;
+      }
+
+      Log.Information("Successfully connected to ECLab device with {ChannelCount} channel(s)", channelCount);
 
       DeviceControlSoftware.MethodParameters.ResultData success = new(true, "Device connected successfully");
       context.ResultParameter = success;
+      Log.Information("The status of the operation is: {Result}", success.Result);
       return Sequence.ResultTypes.Next;
     }
     catch (ECLibException ex)

@@ -34,7 +34,7 @@ internal static class ECLibNative
   /// <param name="id">Output device identifier</param>
   /// <param name="deviceInfo">Output device information</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_Connect(
       [MarshalAs(UnmanagedType.LPStr)] string address,
       byte timeout,
@@ -46,7 +46,7 @@ internal static class ECLibNative
   /// </summary>
   /// <param name="id">Device identifier</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_Disconnect(int id);
 
   /// <summary>
@@ -54,7 +54,7 @@ internal static class ECLibNative
   /// </summary>
   /// <param name="id">Device identifier</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_TestConnection(int id);
 
   /// <summary>
@@ -65,7 +65,7 @@ internal static class ECLibNative
   /// <param name="rcvtSpeed">Received speed</param>
   /// <param name="kernelSpeed">Kernel speed</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_TestCommSpeed(
       int id,
       byte channel,
@@ -79,20 +79,18 @@ internal static class ECLibNative
   /// <summary>
   /// Get library version
   /// </summary>
-  /// <param name="version">Output version code</param>
   /// <param name="versionStr">Output version string buffer</param>
-  /// <param name="size">Buffer size</param>
+  /// <param name="size">Pointer to buffer size (input: max size, output: actual size)</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_GetLibVersion(
-      out int version,
       StringBuilder versionStr,
-      int size);
+      ref uint size);
 
   /// <summary>
   /// Get USB device information by index
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   [return: MarshalAs(UnmanagedType.Bool)]
   internal static extern bool BL_GetUSBdeviceinfos(
       int index,
@@ -110,7 +108,7 @@ internal static class ECLibNative
   /// <param name="channel">Channel index (0-based)</param>
   /// <param name="channelInfo">Output channel information</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_GetChannelInfos(
       int id,
       byte channel,
@@ -123,7 +121,7 @@ internal static class ECLibNative
   /// <param name="channels">Output channel array (16 bytes)</param>
   /// <param name="size">Array size</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_GetChannelsPlugged(
       int id,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] byte[] channels,
@@ -136,7 +134,7 @@ internal static class ECLibNative
   /// <param name="message">Output message buffer</param>
   /// <param name="size">Buffer size</param>
   /// <returns>Error code (0 = success)</returns>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_GetErrorMsg(
       int errorCode,
       StringBuilder message,
@@ -147,9 +145,18 @@ internal static class ECLibNative
   #region Firmware Management
 
   /// <summary>
+  /// Get short path name (8.3 format) for better compatibility with native libraries
+  /// </summary>
+  [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+  private static extern int GetShortPathName(
+      [MarshalAs(UnmanagedType.LPTStr)] string lpszLongPath,
+      [MarshalAs(UnmanagedType.LPTStr)] StringBuilder lpszShortPath,
+      int cchBuffer);
+
+  /// <summary>
   /// Load firmware to specified channels
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_LoadFirmware(
       int id,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] bool[] channels,
@@ -161,9 +168,44 @@ internal static class ECLibNative
       [MarshalAs(UnmanagedType.LPStr)] string fpgaPath);
 
   /// <summary>
+  /// Convert long path to short path (8.3 format) for better compatibility
+  /// </summary>
+  internal static string GetShortPath(string longPath)
+  {
+    if (string.IsNullOrEmpty(longPath))
+      return longPath;
+
+    StringBuilder shortPath = new StringBuilder(260);
+    int result = GetShortPathName(longPath, shortPath, shortPath.Capacity);
+    
+    if (result == 0)
+    {
+      // Failed to get short path - log the error and return original
+      int errorCode = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+      System.Diagnostics.Debug.WriteLine($"GetShortPathName failed for '{longPath}' with error {errorCode}");
+      return longPath;
+    }
+    
+    if (result > shortPath.Capacity)
+    {
+      // Buffer too small - retry with larger buffer
+      shortPath = new StringBuilder(result);
+      result = GetShortPathName(longPath, shortPath, shortPath.Capacity);
+      
+      if (result == 0 || result > shortPath.Capacity)
+      {
+        System.Diagnostics.Debug.WriteLine($"GetShortPathName failed for '{longPath}' on retry");
+        return longPath;
+      }
+    }
+    
+    return shortPath.ToString();
+  }
+
+  /// <summary>
   /// Load flash firmware
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_LoadFlash(
       int id,
       [MarshalAs(UnmanagedType.LPStr)] string firmwarePath,
@@ -176,7 +218,7 @@ internal static class ECLibNative
   /// <summary>
   /// Get hardware configuration
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_GetHardConf(
       int id,
       byte channel,
@@ -185,7 +227,7 @@ internal static class ECLibNative
   /// <summary>
   /// Set hardware configuration
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_SetHardConf(
       int id,
       byte channel,
@@ -194,7 +236,7 @@ internal static class ECLibNative
   /// <summary>
   /// Set hardware configuration (alternative signature with separate parameters)
   /// </summary>
-  [DllImport(DllName, EntryPoint = "BL_SetHardConf", CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, EntryPoint = "BL_SetHardConf", CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_SetHardConf(
       int id,
       byte channel,
@@ -208,7 +250,7 @@ internal static class ECLibNative
   /// <summary>
   /// Load technique from .ecc file
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_LoadTechnique(
       int id,
       byte channel,
@@ -221,7 +263,7 @@ internal static class ECLibNative
   /// <summary>
   /// Define boolean parameter for technique
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_DefineBoolParameter(
       [MarshalAs(UnmanagedType.LPStr)] string label,
       [MarshalAs(UnmanagedType.Bool)] bool value,
@@ -231,7 +273,7 @@ internal static class ECLibNative
   /// <summary>
   /// Define integer parameter for technique
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_DefineIntParameter(
       [MarshalAs(UnmanagedType.LPStr)] string label,
       int value,
@@ -241,7 +283,7 @@ internal static class ECLibNative
   /// <summary>
   /// Define single (float) parameter for technique
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_DefineSglParameter(
       [MarshalAs(UnmanagedType.LPStr)] string label,
       float value,
@@ -251,7 +293,7 @@ internal static class ECLibNative
   /// <summary>
   /// Update technique parameters
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_UpdateParameters(
       int id,
       byte channel,
@@ -266,13 +308,13 @@ internal static class ECLibNative
   /// <summary>
   /// Start a single channel
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_StartChannel(int id, byte channel);
 
   /// <summary>
   /// Start multiple channels
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_StartChannels(
       int id,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] bool[] channels,
@@ -282,13 +324,13 @@ internal static class ECLibNative
   /// <summary>
   /// Stop a single channel
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_StopChannel(int id, byte channel);
 
   /// <summary>
   /// Stop multiple channels
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_StopChannels(
       int id,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] bool[] channels,
@@ -302,7 +344,7 @@ internal static class ECLibNative
   /// <summary>
   /// Get current values from channel
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_GetCurrentValues(
       int id,
       byte channel,
@@ -311,7 +353,7 @@ internal static class ECLibNative
   /// <summary>
   /// Get data from channel
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_GetData(
       int id,
       byte channel,
@@ -322,7 +364,7 @@ internal static class ECLibNative
   /// <summary>
   /// Convert numeric value to single (float)
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_ConvertNumericIntoSingle(
       uint numericValue,
       out float floatValue);
@@ -330,7 +372,7 @@ internal static class ECLibNative
   /// <summary>
   /// Convert channel-specific numeric value to single (float)
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_ConvertChannelNumericIntoSingle(
       uint numericValue,
       out float floatValue,
@@ -339,7 +381,7 @@ internal static class ECLibNative
   /// <summary>
   /// Convert time numeric values to seconds
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_ConvertTimeChannelNumericIntoSeconds(
       [MarshalAs(UnmanagedType.LPArray)] uint[] timeData,
       out double timeSeconds,
@@ -349,7 +391,7 @@ internal static class ECLibNative
   /// <summary>
   /// Get channel board type
   /// </summary>
-  [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_GetChannelBoardType(
       int id,
       byte channel,

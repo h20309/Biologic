@@ -75,23 +75,23 @@ public static class TechniqueParameterBuilder
     {
       case bool boolValue:
         param.ParamType = (int)PARAM_TYPE.PARAM_BOOLEAN;
-        param.ParamVal = boolValue ? 1u : 0u;
+        param.ParamVal = boolValue ? 1 : 0;
         break;
 
       case int intValue:
         param.ParamType = (int)PARAM_TYPE.PARAM_INT;
-        param.ParamVal = (uint)intValue;
+        param.ParamVal = intValue;
         break;
 
       case float floatValue:
         param.ParamType = (int)PARAM_TYPE.PARAM_SINGLE;
-        param.ParamVal = BitConverter.ToUInt32(BitConverter.GetBytes(floatValue), 0);
+        param.ParamVal = BitConverter.ToInt32(BitConverter.GetBytes(floatValue), 0);
         break;
 
       case double doubleValue:
         param.ParamType = (int)PARAM_TYPE.PARAM_SINGLE;
         float f = (float)doubleValue;
-        param.ParamVal = BitConverter.ToUInt32(BitConverter.GetBytes(f), 0);
+        param.ParamVal = BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
         break;
 
       default:

@@ -1,4 +1,4 @@
-using Biologic.Communications;
+﻿using Biologic.Communications;
 using Biologic.Native;
 using DeviceControlSoftware;
 using Serilog;
@@ -11,19 +11,31 @@ namespace Biologic.Devices;
 /// </summary>
 public class ECLabDevice : Device
 {
-  public const string DeviceName = "ECLabDevice";
+  public static readonly string DeviceName = "EC-LAB";
 
   private readonly ECLabCommunication communication;
   private readonly Dictionary<byte, ChannelInfo> channelInfos = new();
   private BOARD_TYPE boardType = BOARD_TYPE.ESSENTIAL;
+  private readonly string? techniquesPath;
 
   public override string Name => DeviceName;
 
   public override bool IsBusy => false; // TODO: Implement based on channel states
 
-  public ECLabDevice(ECLabCommunication communication)
+  public bool IsConnected => this.communication.IsOpen;
+
+  public int DeviceId => this.communication.DeviceId;
+
+  public string TechniquesPath => this.GetTechniquesDirectory();
+
+  public ECLabDevice(ECLabCommunication communication, string? techniquesPath = null)
   {
     this.communication = communication ?? throw new ArgumentNullException(nameof(communication));
+    this.techniquesPath = techniquesPath;
+    
+    // Register communication with base Device class CommunicationController
+    // This enables automatic connection management and OPC UA node integration
+    this.communications.Add(new CommunicationController(this.Name, "VSP-3e", communication));
   }
 
   /// <summary>
@@ -35,7 +47,11 @@ public class ECLabDevice : Device
     // Just initialize the device after communication is open
     if (this.communication.IsOpen)
     {
-      this.Initialize();
+      bool success = this.Initialize();
+      if (!success)
+      {
+        throw new InvalidOperationException("Failed to initialize ECLab device - firmware loading failed");
+      }
     }
   }
 
@@ -64,20 +80,54 @@ public class ECLabDevice : Device
 
       Log.Information("Initializing ECLab device {DeviceId}", this.communication.DeviceId);
 
-      // Discover channels
-      this.DiscoverChannels();
-
       // Get library version
       try
       {
-        var (version, versionStr) = ECLibApi.GetLibVersion();
-        Log.Information("ECLib version: {Version} ({VersionString})", version, versionStr);
+        string versionStr = ECLibApi.GetLibVersion();
+        Log.Information("ECLib version: {VersionString}", versionStr);
       }
       catch (ECLibException ex)
       {
         Log.Warning("Failed to get ECLib version: {Error}", ex.Message);
       }
 
+      // Determine board type BEFORE loading firmware
+      // This ensures we load the correct firmware for the hardware
+      try
+      {
+        int[] pluggedChannels = ECLibApi.GetChannelsPlugged(this.communication.DeviceId);
+        if (pluggedChannels.Length > 0)
+        {
+          // Use first plugged channel to determine board type
+          int firstChannel = pluggedChannels[0];
+          this.boardType = ECLibApi.GetChannelBoardType(this.communication.DeviceId, firstChannel);
+          Log.Information("Board type detected: {BoardType} (from channel {Channel})", this.boardType, firstChannel);
+        }
+        else
+        {
+          Log.Warning("No channels plugged, using default board type: {BoardType}", this.boardType);
+        }
+      }
+      catch (ECLibException ex)
+      {
+        Log.Warning("Failed to determine board type: {Error}, using default: {BoardType}", ex.Message, this.boardType);
+      }
+
+      // Load firmware to all plugged channels AFTER determining board type
+      // Note: BL_GetChannelInfos requires firmware to be loaded (returns -308 FIRM_FIRMWARENOTLOADED otherwise)
+      Log.Information("Loading firmware to all plugged channels...");
+      bool firmwareLoaded = this.LoadFirmwareAllChannels(force: true, showGauge: false);
+      
+      if (!firmwareLoaded)
+      {
+        Log.Error("Firmware loading failed - device initialization failed");
+        return false;
+      }
+
+      // Now discover channels (firmware should be loaded)
+      this.DiscoverChannels();
+
+      Log.Information("Device initialized successfully");
       return true;
     }
     catch (Exception ex)
@@ -131,18 +181,20 @@ public class ECLabDevice : Device
           }
           catch (ECLibException ex)
           {
-            Log.Warning("Failed to get info for channel {Channel}: {Error}", ch, ex.Message);
+            // Check if firmware not loaded error
+            if (ex.ErrorCode == (int)BL_ERROR.FIRM_FIRMWARENOTLOADED)
+            {
+              Log.Warning("Channel {Channel}: Firmware not loaded. Please load firmware first.", ch);
+            }
+            else
+            {
+              Log.Warning("Failed to get info for channel {Channel}: {Error}", ch, ex.Message);
+            }
           }
         }
       }
 
-      // Determine board type from first channel
-      if (this.channelInfos.Count > 0)
-      {
-        byte firstChannel = this.channelInfos.Keys.First();
-        this.boardType = this.DetermineBoardType(firstChannel);
-        Log.Information("Board type detected: {BoardType}", this.boardType);
-      }
+      // Board type已经在Initialize中确定，无需再次检测
     }
     catch (ECLibException ex)
     {
@@ -152,24 +204,21 @@ public class ECLabDevice : Device
 
   /// <summary>
   /// Determine board type for firmware selection
+  /// Uses BL_GetChannelBoardType API to get actual hardware board type
   /// </summary>
+  /// <param name="channel">Channel number (0-based)</param>
+  /// <returns>Board type for firmware selection</returns>
   private BOARD_TYPE DetermineBoardType(byte channel)
   {
     try
     {
-      var deviceCode = (DEVICE)this.communication.DeviceInfo.DeviceCode;
-
-      return deviceCode switch
-      {
-        DEVICE.VMP3 or DEVICE.VMP3E => BOARD_TYPE.ESSENTIAL,
-        DEVICE.VSP or DEVICE.VSP300 or DEVICE.VSP3E => BOARD_TYPE.PREMIUM,
-        DEVICE.SP50 or DEVICE.SP100 or DEVICE.SP150 or
-        DEVICE.SP200 or DEVICE.SP240 or DEVICE.SP300 => BOARD_TYPE.DIGICORE,
-        _ => BOARD_TYPE.ESSENTIAL
-      };
+      // Use the actual BL_GetChannelBoardType API (channel is 0-based, API expects 1-based)
+      BOARD_TYPE boardType = ECLibApi.GetChannelBoardType(this.communication.DeviceId, channel + 1);
+      return boardType;
     }
-    catch
+    catch (Exception ex)
     {
+      Log.Warning(ex, "Failed to get board type for channel {Channel}, defaulting to ESSENTIAL", channel);
       return BOARD_TYPE.ESSENTIAL;
     }
   }
@@ -189,11 +238,47 @@ public class ECLabDevice : Device
     {
       string firmwarePath = this.GetFirmwarePath(this.boardType, out string fpgaPath);
 
+      // Verify firmware files exist before loading
+      if (!File.Exists(firmwarePath))
+      {
+        Log.Error("Firmware file not found: {FirmwarePath}", firmwarePath);
+        return false;
+      }
+
+      if (!string.IsNullOrEmpty(fpgaPath) && !File.Exists(fpgaPath))
+      {
+        Log.Error("FPGA file not found: {FpgaPath}", fpgaPath);
+        return false;
+      }
+
+      // Diagnostic: Log file attributes to verify accessibility
+      try
+      {
+        FileInfo kernelInfo = new FileInfo(firmwarePath);
+        Log.Debug("Kernel file: Path={Path}, Exists={Exists}, Length={Length}, ReadOnly={ReadOnly}", 
+                  kernelInfo.FullName, kernelInfo.Exists, kernelInfo.Length, kernelInfo.IsReadOnly);
+        
+        if (!string.IsNullOrEmpty(fpgaPath))
+        {
+          FileInfo fpgaInfo = new FileInfo(fpgaPath);
+          Log.Debug("FPGA file: Path={Path}, Exists={Exists}, Length={Length}, ReadOnly={ReadOnly}", 
+                    fpgaInfo.FullName, fpgaInfo.Exists, fpgaInfo.Length, fpgaInfo.IsReadOnly);
+        }
+      }
+      catch (Exception ex)
+      {
+        Log.Warning(ex, "Failed to read file attributes");
+      }
+
       Log.Information(
-          "Loading firmware for channel {Channel}: {Firmware}, FPGA: {Fpga}",
+          "Loading firmware for channel {Channel} (1-based: {OneBased}): Kernel={Firmware}, FPGA={Fpga}, BoardType={BoardType}, Force={Force}, ShowGauge={ShowGauge}",
           channel,
+          channel + 1,
           firmwarePath,
-          fpgaPath);
+          fpgaPath,
+          this.boardType,
+          force,
+          showGauge);
 
       try
       {
@@ -209,13 +294,34 @@ public class ECLabDevice : Device
         if (results.TryGetValue(channel + 1, out int result) && result != 0)
         {
           string errorMsg = ECLibApi.GetErrorMessage(result);
-          Log.Error("Firmware loading failed: {Error}", errorMsg);
+          Log.Error("Firmware loading failed for channel {Channel}: {Error} (code: {Code})", 
+                    channel + 1, errorMsg, result);
+          
+          // Special handling for XIL file not found error (-304)
+          if (result == (int)BL_ERROR.FIRM_XILFILENOTEXISTS)
+          {
+            Log.Error("XIL (FPGA) file access failed. This may indicate:");
+            Log.Error("  1. File permission issues with: {FpgaPath}", fpgaPath);
+            Log.Error("  2. ECLib internal file access restrictions");
+            Log.Error("  3. File is locked by another process");
+            Log.Error("Suggestion: Try running the application as Administrator");
+          }
+          
           return false;
         }
       }
       catch (ECLibException ex)
       {
         Log.Error("Firmware loading failed: {Error}", ex.Message);
+        
+        // Special handling for communication errors that may indicate device state issues
+        if (ex.ErrorCode == (int)BL_ERROR.COMM_ALLOCMEMFAILED || 
+            ex.ErrorCode == (int)BL_ERROR.COMM_COMMFAILED)
+        {
+          Log.Error("Communication/memory error detected. Device may be in unstable state.");
+          Log.Error("Suggestion: Disconnect and reconnect the device before retrying");
+        }
+        
         return false;
       }
 
@@ -304,31 +410,19 @@ public class ECLabDevice : Device
 
   /// <summary>
   /// Get firmware file paths based on board type
-  /// Files are loaded from the deployed lib/ directory
+  /// Returns relative paths based on TechniquesPath configuration from setting.json.
+  /// Working directory is already set to setting.json location by App.xaml.cs.
   /// </summary>
+  /// <param name="boardType">Board type to select appropriate firmware files</param>
+  /// <param name="fpgaPath">Output: relative path to FPGA file</param>
+  /// <returns>Relative path to kernel firmware file</returns>
   private string GetFirmwarePath(BOARD_TYPE boardType, out string fpgaPath)
   {
-    // Use deployed EC-Lab Development Package directory
-    string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-    string firmwareDir = Path.Combine(baseDir, "EC-Lab Development Package", "lib");
+    // Use configured techniques path (relative to working directory)
+    // Default to "lib" if not configured
+    string firmwareDir = this.techniquesPath ?? "lib";
 
-    // Fallback to simple lib/ directory if EC-Lab package not found
-    if (!Directory.Exists(firmwareDir))
-    {
-      firmwareDir = Path.Combine(baseDir, "lib");
-      
-      // Final fallback to system installation
-      if (!Directory.Exists(firmwareDir))
-      {
-        Log.Warning("lib directory not found in application directory, using system installation");
-        firmwareDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-            "EC-Lab Development Package",
-            "Data");
-      }
-    }
-
-    Log.Debug("Using firmware directory: {FirmwareDir}", firmwareDir);
+    Log.Debug("Using firmware directory: {FirmwareDir} (relative to working directory)", firmwareDir);
 
     switch (boardType)
     {
@@ -342,7 +436,7 @@ public class ECLabDevice : Device
 
       case BOARD_TYPE.DIGICORE:
         fpgaPath = string.Empty;
-        return Path.Combine(firmwareDir, "kernel5.bin");
+        return Path.Combine(firmwareDir, "kernel.bin");
 
       default:
         throw new NotSupportedException($"Unsupported board type: {boardType}");
@@ -381,6 +475,14 @@ public class ECLabDevice : Device
   }
 
   /// <summary>
+  /// Get techniques directory path (relative to working directory)
+  /// </summary>
+  private string GetTechniquesDirectory()
+  {
+    return this.techniquesPath ?? "lib";
+  }
+
+  /// <summary>
   /// Get property by name for SequenceItem compatibility
   /// </summary>
   public object? GetProperty(string propertyName)
@@ -392,6 +494,7 @@ public class ECLabDevice : Device
       "IsError" => this.communication.IsError,
       "DeviceInfo" => this.communication.DeviceInfo,
       "ChannelCount" => this.channelInfos.Count,
+      "TechniquesPath" => this.TechniquesPath,
       _ => null
     };
   }

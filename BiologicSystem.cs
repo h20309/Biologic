@@ -23,18 +23,22 @@ public class BiologicSystem : SequenceDispatcher
 
   protected override void Setup()
   {
-    // Get device address from settings
-    string address = this.Settings?.Properties["ECLab"]?["Address"]?.ToString() ?? "USB0";
-    int timeoutMs = int.Parse(this.Settings?.Properties["ECLab"]?["TimeoutMs"]?.ToString() ?? "5000");
+    // Get device configuration from settings
+    string deviceName = this.Settings?.Properties["EC-LAB"]?["DeviceName"]?.ToString() ?? "EC-LAB";
+    string address = this.Settings?.Properties["EC-LAB"]?["Address"]?.ToString() ?? "USB0";
+    int timeoutMs = int.Parse(this.Settings?.Properties["EC-LAB"]?["TimeoutMs"]?.ToString() ?? "5000");
+    string? techniquesPath = this.Settings?.Properties["EC-LAB"]?["TechniquesPath"]?.ToString();
 
     // Create communication
     this.communication = new ECLabCommunication(address, timeoutMs);
 
-    // Create device
-    this.device = new ECLabDevice(this.communication);
+    // Create device with techniques path from configuration
+    // TechniquesPath contains both technique files and firmware files
+    this.device = new ECLabDevice(this.communication, techniquesPath);
 
-    // Register devices
-    this.devices.Add(ECLabDevice.DeviceName, this.device);
+    // Register device with configured name (from setting.json)
+    // This name must match the node name in OPC UA NodeSet XML file
+    this.devices.Add(deviceName, this.device);
 
     // Register sequence creators
     // Device management

@@ -127,13 +127,24 @@ public enum PARAM_TYPE
   PARAM_SINGLE = 2
 }
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
+// CRITICAL: Structure layout MUST match C++ definition exactly!
+// From BLStructs.h:
+//   typedef struct {
+//       char ParamStr[64];  // 64 bytes
+//       int ParamType;      // 4 bytes
+//       int ParamVal;       // 4 bytes
+//       int ParamIndex;     // 4 bytes
+//   } TEccParam_t;
+//
+// Total size: 76 bytes (64 + 4 + 4 + 4)
+// Pack = 4 for natural alignment (matching C++ default)
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
 public struct EccParam
 {
   [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)]
   public byte[] ParamStr;
   public int ParamType;
-  public uint ParamVal;
+  public int ParamVal;    // Changed from uint to int to match C++ definition
   public int ParamIndex;
 }
 

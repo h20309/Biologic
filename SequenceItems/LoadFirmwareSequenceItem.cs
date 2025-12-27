@@ -17,34 +17,34 @@ public class LoadFirmwareSequenceItem : SequenceItem
 
   public override void Initialize(Sequence.StateContext context)
   {
-    if (Properties == null)
-      throw new ArgumentNullException(nameof(Properties));
+    if (this.Properties == null)
+      throw new ArgumentNullException(nameof(this.Properties));
 
     // Check if loading all channels or specific channels
-    _loadAll = Convert.ToBoolean(Properties.GetValueOrDefault("LoadAll") ?? false);
-    
-    if (!_loadAll)
+    this._loadAll = Convert.ToBoolean(this.Properties.GetValueOrDefault("LoadAll") ?? false);
+
+    if (!this._loadAll)
     {
-      var channelValue = Properties.GetValueOrDefault("Channels");
+      var channelValue = this.Properties.GetValueOrDefault("Channels");
       if (channelValue is string channelStr)
       {
         // Parse comma-separated channel list
-        _channels = channelStr.Split(',')
+        this._channels = channelStr.Split(',')
           .Select(s => Convert.ToByte(s.Trim()))
           .ToArray();
       }
       else if (channelValue is int channelInt)
       {
-        _channels = new[] { (byte)channelInt };
+        this._channels = new[] { (byte)channelInt };
       }
       else
       {
-        _channels = new[] { (byte)0 };
+        this._channels = new[] { (byte)0 };
       }
     }
 
-    _force = Convert.ToBoolean(Properties.GetValueOrDefault("Force") ?? false);
-    _showGauge = Convert.ToBoolean(Properties.GetValueOrDefault("ShowGauge") ?? false);
+    this._force = Convert.ToBoolean(this.Properties.GetValueOrDefault("Force") ?? false);
+    this._showGauge = Convert.ToBoolean(this.Properties.GetValueOrDefault("ShowGauge") ?? false);
   }
 
   public override Sequence.ResultTypes Execute(Sequence.StateContext context)
@@ -60,26 +60,26 @@ public class LoadFirmwareSequenceItem : SequenceItem
       bool success;
       string message;
 
-      if (_loadAll)
+      if (this._loadAll)
       {
-        Log.Information("Loading firmware to all channels (Force: {Force}, ShowGauge: {ShowGauge})", _force, _showGauge);
-        success = ecLabDevice.LoadFirmwareAllChannels(_force, _showGauge);
+        Log.Information("Loading firmware to all channels (Force: {Force}, ShowGauge: {ShowGauge})", this._force, this._showGauge);
+        success = ecLabDevice.LoadFirmwareAllChannels(this._force, this._showGauge);
         message = success ? "Firmware loaded to all channels" : "Failed to load firmware to some channels";
       }
       else
       {
-        if (_channels == null || _channels.Length == 0)
+        if (this._channels == null || this._channels.Length == 0)
         {
           throw new InvalidOperationException("No channels specified for firmware loading");
         }
 
-        Log.Information("Loading firmware to channel(s): {Channels} (Force: {Force}, ShowGauge: {ShowGauge})", 
-          string.Join(", ", _channels), _force, _showGauge);
+        Log.Information("Loading firmware to channel(s): {Channels} (Force: {Force}, ShowGauge: {ShowGauge})",
+          string.Join(", ", this._channels), this._force, this._showGauge);
 
         success = true;
-        foreach (byte channel in _channels)
+        foreach (byte channel in this._channels)
         {
-          bool channelSuccess = ecLabDevice.LoadFirmware(channel, _force, _showGauge);
+          bool channelSuccess = ecLabDevice.LoadFirmware(channel, this._force, this._showGauge);
           if (!channelSuccess)
           {
             Log.Error("Failed to load firmware for channel {Channel}", channel);
@@ -87,8 +87,8 @@ public class LoadFirmwareSequenceItem : SequenceItem
           }
         }
 
-        message = success 
-          ? $"Firmware loaded to channel(s): {string.Join(", ", _channels)}"
+        message = success
+          ? $"Firmware loaded to channel(s): {string.Join(", ", this._channels)}"
           : "Failed to load firmware to some channels";
       }
 

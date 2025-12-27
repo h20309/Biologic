@@ -67,7 +67,7 @@ public class PEISSequenceItem : SequenceItem
       // Load PEIS technique
       string eccPath = Path.Combine(
         AppDomain.CurrentDomain.BaseDirectory,
-        "Techniques",
+        "EC-Lab Development Package\\lib",
         "peis.ecc");
 
       if (!File.Exists(eccPath))
@@ -184,23 +184,23 @@ public class PEISSequenceItem : SequenceItem
       if (value is bool boolValue)
       {
         param.ParamType = (int)PARAM_TYPE.PARAM_BOOLEAN;
-        param.ParamVal = boolValue ? 1u : 0u;
+        param.ParamVal = boolValue ? 1 : 0;
       }
       else if (value is int intValue)
       {
         param.ParamType = (int)PARAM_TYPE.PARAM_INT;
-        param.ParamVal = (uint)intValue;
+        param.ParamVal = intValue;
       }
       else if (value is float floatValue)
       {
         param.ParamType = (int)PARAM_TYPE.PARAM_SINGLE;
-        param.ParamVal = BitConverter.ToUInt32(BitConverter.GetBytes(floatValue), 0);
+        param.ParamVal = BitConverter.ToInt32(BitConverter.GetBytes(floatValue), 0);
       }
       else if (value is double doubleValue)
       {
         param.ParamType = (int)PARAM_TYPE.PARAM_SINGLE;
         float f = (float)doubleValue;
-        param.ParamVal = BitConverter.ToUInt32(BitConverter.GetBytes(f), 0);
+        param.ParamVal = BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
       }
 
       paramList.Add(param);

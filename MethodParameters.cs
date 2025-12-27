@@ -75,32 +75,34 @@ public class MethodParameters
     string? OutputFile = null);
 
   /// <summary>
-  /// Parameters for battery charging
+  /// Parameters for battery charging using CA (Chrono-Amperometry) technique
+  /// CA applies constant voltage steps and measures current response
   /// </summary>
   /// <param name="ChannelIndex">Zero-based channel index (0-15)</param>
-  /// <param name="Current_A">Charging current in amperes</param>
+  /// <param name="Voltage_V">Applied voltage in volts</param>
   /// <param name="Duration_s">Maximum charge duration in seconds</param>
-  /// <param name="CutoffVoltage_V">Upper voltage limit in volts</param>
+  /// <param name="RecordInterval_s">Data recording interval in seconds (default: 1.0)</param>
   /// <param name="OutputFile">Output CSV file path (optional)</param>
   public record Charge(
     int ChannelIndex,
-    float Current_A,
+    float Voltage_V,
     float Duration_s,
-    float CutoffVoltage_V,
+    float RecordInterval_s = 1.0f,
     string? OutputFile = null);
 
   /// <summary>
-  /// Parameters for battery discharging
+  /// Parameters for battery discharging using CA (Chrono-Amperometry) technique
+  /// CA applies constant voltage steps and measures current response
   /// </summary>
   /// <param name="ChannelIndex">Zero-based channel index (0-15)</param>
-  /// <param name="Current_A">Discharge current in amperes (negative)</param>
+  /// <param name="Voltage_V">Applied voltage in volts</param>
   /// <param name="Duration_s">Maximum discharge duration in seconds</param>
-  /// <param name="CutoffVoltage_V">Lower voltage limit in volts</param>
+  /// <param name="RecordInterval_s">Data recording interval in seconds (default: 1.0)</param>
   /// <param name="OutputFile">Output CSV file path (optional)</param>
   public record Discharge(
     int ChannelIndex,
-    float Current_A,
+    float Voltage_V,
     float Duration_s,
-    float CutoffVoltage_V,
+    float RecordInterval_s = 1.0f,
     string? OutputFile = null);
 }
