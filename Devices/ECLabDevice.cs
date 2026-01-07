@@ -116,7 +116,7 @@ public class ECLabDevice : Device
       // Load firmware to all plugged channels AFTER determining board type
       // Note: BL_GetChannelInfos requires firmware to be loaded (returns -308 FIRM_FIRMWARENOTLOADED otherwise)
       Log.Information("Loading firmware to all plugged channels...");
-      bool firmwareLoaded = this.LoadFirmwareAllChannels(force: true, showGauge: false);
+      bool firmwareLoaded = this.LoadFirmwareAllChannels(force: false, showGauge: false);
       
       if (!firmwareLoaded)
       {

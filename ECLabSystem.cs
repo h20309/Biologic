@@ -9,7 +9,7 @@ namespace Biologic;
 /// <summary>
 /// BioLogic electrochemistry system dispatcher
 /// </summary>
-public class BiologicSystem : SequenceDispatcher
+public class ECLabSystem : SequenceDispatcher
 {
   protected override string Name => "BiologicSystem";
 
@@ -64,6 +64,10 @@ public class BiologicSystem : SequenceDispatcher
     // Data acquisition
     this.AddSequenceCreator("GetData", (prop) => new GetDataSequenceItem { Properties = prop });
     this.AddSequenceCreator("WaitForCompletion", (prop) => new WaitForCompletionSequenceItem { Properties = prop });
+    
+    // Data polling control
+    this.AddSequenceCreator("StartPolling", (prop) => new StartPollingSequenceItem { Properties = prop });
+    this.AddSequenceCreator("StopPolling", (prop) => new StopPollingSequenceItem { Properties = prop });
 
     // Register method parameter creators for OPC UA Methods
     // These enable dynamic technique execution via OPC UA with strongly-typed parameters
@@ -73,5 +77,13 @@ public class BiologicSystem : SequenceDispatcher
     this.SequenceController.AddMethodParameterCreator("RunGEIS", (x) => JsonSerializer.Deserialize<MethodParameters.RunGEIS>(x ?? string.Empty)!);
     this.SequenceController.AddMethodParameterCreator("Charge", (x) => JsonSerializer.Deserialize<MethodParameters.Charge>(x ?? string.Empty)!);
     this.SequenceController.AddMethodParameterCreator("Discharge", (x) => JsonSerializer.Deserialize<MethodParameters.Discharge>(x ?? string.Empty)!);
+  }
+
+  /// <summary>
+  /// Get ECLabDevice instance for derived classes
+  /// </summary>
+  protected ECLabDevice? GetECLabDevice()
+  {
+    return this.device;
   }
 }

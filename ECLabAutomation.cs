@@ -8,10 +8,11 @@ using Serilog;
 namespace Biologic;
 
 /// <summary>
-/// Advanced sequence dispatcher with data polling capabilities
-/// Extends BiologicSystem with real-time data acquisition and monitoring
+/// EC-Lab automation controller with real-time data polling capabilities
+/// Extends ECLabSystem with automated data acquisition, monitoring, and OPC UA node updates.
+/// This layer is client-facing and provides high-level automation APIs with OPC UA integration.
 /// </summary>
-public class ECLabSequenceDispatcher : BiologicSystem, IDisposable
+public class ECLabAutomation : ECLabSystem, IDisposable
 {
   private readonly ConcurrentDictionary<byte, ChannelDataPoller> channelPollers = new();
   private readonly CancellationTokenSource cancellationTokenSource = new();
@@ -47,13 +48,55 @@ public class ECLabSequenceDispatcher : BiologicSystem, IDisposable
   /// </summary>
   public int DefaultPollingInterval { get; set; } = 1000;
 
+  protected override void Setup()
+  {
+    // Call base class setup first
+    base.Setup();
+
+    // Read polling configuration from settings
+    bool enablePolling = bool.Parse(
+      this.Settings?.Properties["EC-LAB"]?["EnableDataPolling"]?.ToString() ?? "false");
+
+    if (enablePolling)
+    {
+      int pollingInterval = int.Parse(
+        this.Settings?.Properties["EC-LAB"]?["PollingInterval"]?.ToString() ?? "1000");
+
+      this.DefaultPollingInterval = pollingInterval;
+      this.IsPollingEnabled = true;
+
+      Log.Information("OPC UA data polling configured: Enabled={Enabled}, Interval={Interval}ms",
+        enablePolling, pollingInterval);
+    }
+  }
+
   /// <summary>
-  /// Start polling data for specific channel
+  /// Start the automation system
+  /// </summary>
+  /// <remarks>
+  /// Note: Polling is auto-started after device connection in ConnectDeviceSequenceItem,
+  /// not here, because the device may not be connected yet when Start() is called.
+  /// </remarks>
+  public new void Start()
+  {
+    base.Start();
+  }
+
+  /// <summary>
+  /// Stop the automation system and clean up polling
+  /// </summary>
+  public new void Stop()
+  {
+    StopAllPollers();
+    base.Stop();
+  }
+
+  /// <summary>
+  /// Start polling data for specific channel with OPC UA node updates
   /// </summary>
   /// <param name="channel">Channel index (0-based)</param>
   /// <param name="pollingIntervalMs">Polling interval in milliseconds</param>
-  /// <param name="dataHandler">Optional callback for each data batch</param>
-  public void StartPolling(byte channel, int pollingIntervalMs = 0, Action<ChannelDataBatch>? dataHandler = null)
+  public void StartPolling(byte channel, int pollingIntervalMs = 0)
   {
     if (pollingIntervalMs <= 0)
       pollingIntervalMs = DefaultPollingInterval;
@@ -71,17 +114,19 @@ public class ECLabSequenceDispatcher : BiologicSystem, IDisposable
       return;
     }
 
+    // Create poller with OPC UA update callback
     var poller = new ChannelDataPoller(
         device,
         channel,
         pollingIntervalMs,
-        dataHandler,
+        UpdateOpcUaNodes, // Callback to update OPC UA nodes
         cancellationTokenSource.Token);
 
     if (channelPollers.TryAdd(channel, poller))
     {
       poller.Start();
-      Log.Information("Started polling for channel {Channel} with interval {Interval}ms", channel, pollingIntervalMs);
+      Log.Information("Started OPC UA polling for channel {Channel} with interval {Interval}ms",
+        channel, pollingIntervalMs);
     }
   }
 
@@ -143,6 +188,94 @@ public class ECLabSequenceDispatcher : BiologicSystem, IDisposable
     {
       poller.ClearCache();
       Log.Information("Cleared data cache for channel {Channel}", channel);
+    }
+  }
+
+  /// <summary>
+  /// Update OPC UA nodes with latest channel data
+  /// This is called automatically by the data poller
+  /// </summary>
+  private void UpdateOpcUaNodes(ChannelDataBatch batch)
+  {
+    try
+    {
+      var device = this.devices.Values.FirstOrDefault() as ECLabDevice;
+      if (device?.Node == null)
+      {
+        Log.Warning("Cannot update OPC UA nodes: device node not found");
+        return;
+      }
+
+      // Get Channels folder node
+      var channelsFolder = device.Node["Channels"];
+      if (channelsFolder == null || string.IsNullOrEmpty(channelsFolder.Name))
+      {
+        Log.Warning("Channels folder node not found in OPC UA address space");
+        return;
+      }
+
+      // Get specific channel node
+      string channelName = $"Channel{batch.Channel}";
+      var channelNode = channelsFolder[channelName];
+      
+      if (channelNode == null || string.IsNullOrEmpty(channelNode.Name))
+      {
+        Log.Warning("Channel node not found: {ChannelName}. Only Channel0 is currently defined in XML.", channelName);
+        return;
+      }
+
+      // Update current values with safe node access
+      // Use invariant culture to ensure consistent decimal separator (dot instead of comma)
+      UpdateNodeValue(channelNode, "State", ((PROG_STATE)batch.CurrentValues.State).ToString());
+      UpdateNodeValue(channelNode, "Voltage", batch.CurrentValues.Ewe.ToString(System.Globalization.CultureInfo.InvariantCulture));
+      UpdateNodeValue(channelNode, "Current", batch.CurrentValues.I.ToString(System.Globalization.CultureInfo.InvariantCulture));
+      UpdateNodeValue(channelNode, "ElapsedTime", batch.CurrentValues.ElapsedTime.ToString(System.Globalization.CultureInfo.InvariantCulture));
+      UpdateNodeValue(channelNode, "Technique", batch.TechniqueId.ToString());
+
+      // Update data statistics
+      if (batch.DataInfo.NbRows > 0)
+      {
+        UpdateNodeValue(channelNode, "DataRows", batch.DataInfo.NbRows.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        UpdateNodeValue(channelNode, "DataCols", batch.DataInfo.NbCols.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        
+        // Update LastUpdate as ISO 8601 DateTime string for OPC UA DateTime type
+        UpdateNodeValue(channelNode, "LastUpdate", batch.Timestamp.ToUniversalTime().ToString("o"));
+
+        Log.Debug("Updated OPC UA nodes for channel {Channel}: Rows={Rows}, State={State}, V={V:F6}V, I={I:F9}A",
+          batch.Channel, batch.DataInfo.NbRows,
+          (PROG_STATE)batch.CurrentValues.State,
+          batch.CurrentValues.Ewe,
+          batch.CurrentValues.I);
+      }
+    }
+    catch (Exception ex)
+    {
+      Log.Error(ex, "Error updating OPC UA nodes for channel {Channel}", batch.Channel);
+    }
+  }
+
+  /// <summary>
+  /// Safely update a child node value with error handling
+  /// </summary>
+  private void UpdateNodeValue(Node parentNode, string childName, string value)
+  {
+    try
+    {
+      var childNode = parentNode[childName];
+      if (childNode != null && !string.IsNullOrEmpty(childNode.Name))
+      {
+        Log.Debug("Writing to node {NodeName}: '{Value}'", childName, value);
+        childNode.Value = value;
+        Log.Debug("Successfully wrote to node {NodeName}", childName);
+      }
+      else
+      {
+        Log.Warning("Child node '{ChildName}' not found under '{ParentName}'", childName, parentNode.Name);
+      }
+    }
+    catch (Exception ex)
+    {
+      Log.Warning(ex, "Failed to update node '{ChildName}' with value '{Value}'", childName, value);
     }
   }
 

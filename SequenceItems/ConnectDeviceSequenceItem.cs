@@ -52,6 +52,30 @@ public class ConnectDeviceSequenceItem : SequenceItem
 
       Log.Information("Successfully connected to ECLab device with {ChannelCount} channel(s)", channelCount);
 
+      // Auto-start polling if the system is ECLabAutomation and polling is enabled
+      if (context.SequenceDispatcher is ECLabAutomation automation && automation.IsPollingEnabled)
+      {
+        try
+        {
+          // Get all plugged channels
+          int deviceId = ecLabDevice.DeviceId;
+          int[] channels = ECLibApi.GetChannelsPlugged(deviceId);
+          
+          // Start polling for all connected channels
+          foreach (int ch in channels)
+          {
+            byte channel = (byte)(ch - 1); // Convert to 0-based
+            automation.StartPolling(channel);
+          }
+          
+          Log.Information("Auto-started data polling for {Count} connected channel(s)", channels.Length);
+        }
+        catch (Exception ex)
+        {
+          Log.Warning(ex, "Failed to auto-start polling - continuing without real-time data updates");
+        }
+      }
+
       DeviceControlSoftware.MethodParameters.ResultData success = new(true, "Device connected successfully");
       context.ResultParameter = success;
       Log.Information("The status of the operation is: {Result}", success.Result);
