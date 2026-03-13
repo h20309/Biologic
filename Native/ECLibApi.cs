@@ -1,6 +1,5 @@
 using System.Text;
 using Serilog;
-using EClabCOM;
 
 namespace Biologic.Native;
 
