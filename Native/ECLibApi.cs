@@ -1,5 +1,6 @@
 using System.Text;
 using Serilog;
+using EClabCOM;
 
 namespace Biologic.Native;
 
@@ -482,6 +483,27 @@ public class ECLibApi
     int errorCode = ECLibNative.BL_ConvertNumericIntoSingle(numericValue, out float floatValue);
     CheckError(errorCode, "ConvertNumericIntoSingle");
     return floatValue;
+  }
+
+  /// <summary>
+  /// Convert a channel-specific numeric value returned by BL_GetData into a single.
+  /// </summary>
+  public static float ConvertChannelNumericIntoSingle(uint numericValue, uint boardType)
+  {
+    int errorCode = ECLibNative.BL_ConvertChannelNumericIntoSingle(numericValue, out float floatValue, boardType);
+    CheckError(errorCode, "ConvertChannelNumericIntoSingle");
+    return floatValue;
+  }
+
+  /// <summary>
+  /// Convert the two-word channel time value returned by BL_GetData into seconds.
+  /// </summary>
+  public static double ConvertTimeChannelNumericIntoSeconds(uint highValue, uint lowValue, float timeBase, uint boardType)
+  {
+    uint[] timeData = [highValue, lowValue];
+    int errorCode = ECLibNative.BL_ConvertTimeChannelNumericIntoSeconds(timeData, out double timeSeconds, timeBase, boardType);
+    CheckError(errorCode, "ConvertTimeChannelNumericIntoSeconds");
+    return timeSeconds;
   }
 
   #endregion

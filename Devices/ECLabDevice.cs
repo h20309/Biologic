@@ -1,4 +1,4 @@
-﻿using Biologic.Communications;
+using Biologic.Communications;
 using Biologic.Native;
 using DeviceControlSoftware;
 using Serilog;
@@ -194,7 +194,7 @@ public class ECLabDevice : Device
         }
       }
 
-      // Board type已经在Initialize中确定，无需再次检测
+      // Board type is already determined in Initialize, so no re-detection is needed.
     }
     catch (ECLibException ex)
     {

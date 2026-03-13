@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Globalization;
+using System.Text.Json;
 using Biologic.Communications;
 using Biologic.Devices;
 using Biologic.Native;
@@ -14,10 +16,22 @@ namespace Biologic;
 /// </summary>
 public class ECLabAutomation : ECLabSystem, IDisposable
 {
+  private const int MaxEisHistoryCount = 3;
   private readonly ConcurrentDictionary<byte, ChannelDataPoller> channelPollers = new();
+  private readonly ConcurrentDictionary<byte, ChannelEisHistory> eisHistoryByChannel = new();
   private readonly CancellationTokenSource cancellationTokenSource = new();
+  private readonly IReadOnlyDictionary<string, Action<SequenceResult>> resultPublishers;
+  private EventHandler<SequenceCompletedEventArgs>? sequenceCompletedHandler;
   private bool isPollingEnabled = false;
   private bool disposed = false;
+
+  public ECLabAutomation()
+  {
+    this.resultPublishers = new Dictionary<string, Action<SequenceResult>>(StringComparer.OrdinalIgnoreCase)
+    {
+      ["RunGEIS"] = this.PublishGeisResult,
+    };
+  }
 
   /// <summary>
   /// Enable or disable automatic data polling
@@ -52,6 +66,8 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   {
     // Call base class setup first
     base.Setup();
+
+    this.SubscribeResultPublishers();
 
     // Read polling configuration from settings
     bool enablePolling = bool.Parse(
@@ -199,28 +215,8 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   {
     try
     {
-      var device = this.devices.Values.FirstOrDefault() as ECLabDevice;
-      if (device?.Node == null)
+      if (!TryGetChannelNode(batch.Channel, out Node? channelNode))
       {
-        Log.Warning("Cannot update OPC UA nodes: device node not found");
-        return;
-      }
-
-      // Get Channels folder node
-      var channelsFolder = device.Node["Channels"];
-      if (channelsFolder == null || string.IsNullOrEmpty(channelsFolder.Name))
-      {
-        Log.Warning("Channels folder node not found in OPC UA address space");
-        return;
-      }
-
-      // Get specific channel node
-      string channelName = $"Channel{batch.Channel}";
-      var channelNode = channelsFolder[channelName];
-      
-      if (channelNode == null || string.IsNullOrEmpty(channelNode.Name))
-      {
-        Log.Warning("Channel node not found: {ChannelName}. Only Channel0 is currently defined in XML.", channelName);
         return;
       }
 
@@ -252,6 +248,171 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     {
       Log.Error(ex, "Error updating OPC UA nodes for channel {Channel}", batch.Channel);
     }
+  }
+
+  private void SubscribeResultPublishers()
+  {
+    if (this.sequenceCompletedHandler != null)
+    {
+      return;
+    }
+
+    this.sequenceCompletedHandler = (_, args) => this.HandleSequenceCompleted(args.Result);
+    this.SequenceController.SequenceCompleted += this.sequenceCompletedHandler;
+  }
+
+  private void HandleSequenceCompleted(SequenceResult result)
+  {
+    if (!result.Success || string.IsNullOrWhiteSpace(result.Result))
+    {
+      return;
+    }
+
+    if (!this.resultPublishers.TryGetValue(result.SequenceName, out Action<SequenceResult>? publisher))
+    {
+      return;
+    }
+
+    try
+    {
+      publisher(result);
+    }
+    catch (Exception ex)
+    {
+      Log.Error(ex, "Failed to publish sequence result for {SequenceName}", result.SequenceName);
+    }
+  }
+
+  private void PublishGeisResult(SequenceResult result)
+  {
+    using JsonDocument document = JsonDocument.Parse(result.Result!);
+    JsonElement root = document.RootElement.Clone();
+
+    if (!TryGetChannelIndex(root, out byte channelIndex))
+    {
+      Log.Warning("Skipping GEIS result publication because ChannelIndex was missing. ContextId={ContextId}", result.ContextID);
+      return;
+    }
+
+    int spectrumPointCount = GetSpectrumPointCount(root);
+    var snapshot = new EisResultSnapshot
+    {
+      RunId = result.ContextID,
+      SequenceName = result.SequenceName,
+      ChannelIndex = channelIndex,
+      CompletedAtUtc = result.EndTime.ToUniversalTime(),
+      SpectrumPointCount = spectrumPointCount,
+      Result = root,
+    };
+
+    ChannelEisHistory history = this.eisHistoryByChannel.GetOrAdd(channelIndex, static _ => new ChannelEisHistory());
+    string historyJson;
+    string latestResultJson = root.GetRawText();
+
+    lock (history.SyncRoot)
+    {
+      history.Latest = snapshot;
+      history.History.Insert(0, snapshot);
+      while (history.History.Count > MaxEisHistoryCount)
+      {
+        history.History.RemoveAt(history.History.Count - 1);
+      }
+
+      historyJson = SequenceDispatcher.Serialize(history.History);
+    }
+
+    this.UpdateLatestEisNodes(channelIndex, snapshot, latestResultJson, historyJson);
+  }
+
+  private void UpdateLatestEisNodes(byte channelIndex, EisResultSnapshot snapshot, string latestResultJson, string historyJson)
+  {
+    if (!TryGetChannelNode(channelIndex, out Node? channelNode))
+    {
+      return;
+    }
+
+    UpdateNodeValue(channelNode, "LatestEISStatus", "Available");
+    UpdateNodeValue(channelNode, "LatestEISTimestamp", snapshot.CompletedAtUtc.ToString("o", CultureInfo.InvariantCulture));
+    UpdateNodeValue(channelNode, "LatestEISResultJson", latestResultJson);
+    UpdateNodeValue(channelNode, "LatestEISHistoryJson", historyJson);
+    UpdateNodeValue(channelNode, "LatestEISPointCount", snapshot.SpectrumPointCount.ToString(CultureInfo.InvariantCulture));
+    UpdateNodeValue(channelNode, "LatestEISRunId", snapshot.RunId.ToString(CultureInfo.InvariantCulture));
+
+    Log.Information(
+      "Published {SequenceName} result for channel {Channel} to OPC UA history cache. RunId={RunId}, Points={PointCount}",
+      snapshot.SequenceName,
+      channelIndex,
+      snapshot.RunId,
+      snapshot.SpectrumPointCount);
+  }
+
+  private bool TryGetChannelNode(byte channel, out Node? channelNode)
+  {
+    channelNode = null;
+
+    var device = this.devices.Values.FirstOrDefault() as ECLabDevice;
+    if (device?.Node == null)
+    {
+      Log.Warning("Cannot access OPC UA channel nodes: device node not found");
+      return false;
+    }
+
+    var channelsFolder = device.Node["Channels"];
+    if (channelsFolder == null || string.IsNullOrEmpty(channelsFolder.Name))
+    {
+      Log.Warning("Channels folder node not found in OPC UA address space");
+      return false;
+    }
+
+    string channelName = $"Channel{channel}";
+    channelNode = channelsFolder[channelName];
+    if (channelNode == null || string.IsNullOrEmpty(channelNode.Name))
+    {
+      Log.Warning("Channel node not found: {ChannelName}. Only explicitly modeled channels can expose long-lived EIS data.", channelName);
+      return false;
+    }
+
+    return true;
+  }
+
+  private static bool TryGetChannelIndex(JsonElement root, out byte channelIndex)
+  {
+    channelIndex = 0;
+
+    if (!root.TryGetProperty("ChannelIndex", out JsonElement channelElement))
+    {
+      return false;
+    }
+
+    if (!channelElement.TryGetInt32(out int numericChannel) || numericChannel < byte.MinValue || numericChannel > byte.MaxValue)
+    {
+      return false;
+    }
+
+    channelIndex = (byte)numericChannel;
+    return true;
+  }
+
+  private static int GetSpectrumPointCount(JsonElement root)
+  {
+    if (root.TryGetProperty("SpectrumPointCount", out JsonElement pointCountElement) &&
+        pointCountElement.TryGetInt32(out int pointCount))
+    {
+      return pointCount;
+    }
+
+    if (root.TryGetProperty("Spectrum", out JsonElement spectrumElement) && spectrumElement.ValueKind == JsonValueKind.Array)
+    {
+      int count = 0;
+      foreach (JsonElement _ in spectrumElement.EnumerateArray())
+      {
+        count++;
+      }
+
+      return count;
+    }
+
+    return 0;
   }
 
   /// <summary>
@@ -297,6 +458,12 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     {
       if (disposing)
       {
+        if (this.sequenceCompletedHandler != null)
+        {
+          this.SequenceController.SequenceCompleted -= this.sequenceCompletedHandler;
+          this.sequenceCompletedHandler = null;
+        }
+
         cancellationTokenSource.Cancel();
         StopAllPollers();
         cancellationTokenSource.Dispose();
@@ -546,4 +713,28 @@ public class ChannelDataBatch
 
     return sb.ToString();
   }
+}
+
+internal sealed class ChannelEisHistory
+{
+  public object SyncRoot { get; } = new();
+
+  public EisResultSnapshot? Latest { get; set; }
+
+  public List<EisResultSnapshot> History { get; } = new();
+}
+
+internal sealed class EisResultSnapshot
+{
+  public uint RunId { get; init; }
+
+  public string SequenceName { get; init; } = string.Empty;
+
+  public byte ChannelIndex { get; init; }
+
+  public DateTime CompletedAtUtc { get; init; }
+
+  public int SpectrumPointCount { get; init; }
+
+  public JsonElement Result { get; init; }
 }
