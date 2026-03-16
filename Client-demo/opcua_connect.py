@@ -421,7 +421,12 @@ def run_local_discovery() -> int:
     added = merge_discovered_servers(discovered)
     st.session_state.local_discovery_completed = True
     st.session_state.last_discovery_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    set_status(f"Local discovery finished. Added {added} server(s).", "success")
+    if not discovered:
+        set_status("Local discovery finished, but no OPC UA server was found.", "error")
+    elif added == 0:
+        set_status("Local discovery finished, but no new OPC UA server was added.", "info")
+    else:
+        set_status(f"Local discovery finished. Added {added} server(s).", "success")
     return added
 
 
@@ -435,7 +440,12 @@ def run_lan_scan() -> int:
     added = merge_discovered_servers(discovered)
     st.session_state.lan_scan_completed = True
     st.session_state.last_discovery_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    set_status(f"LAN deep scan finished. Added {added} server(s).", "success")
+    if not discovered:
+        set_status("LAN deep scan finished, but no OPC UA server was found.", "error")
+    elif added == 0:
+        set_status("LAN deep scan finished, but no new OPC UA server was added.", "info")
+    else:
+        set_status(f"LAN deep scan finished. Added {added} server(s).", "success")
     return added
 
 
