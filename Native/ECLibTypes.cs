@@ -155,6 +155,17 @@ public struct EccParams
   public IntPtr pParams;  // Pointer to EccParam array
 }
 
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct TechniqueInfos
+{
+  public int Id;
+  public int indx;
+  public int nbParams;
+  public int nbSettings;
+  public IntPtr Params;
+  public IntPtr HardSettings;
+}
+
 #endregion
 
 #region Enumerations

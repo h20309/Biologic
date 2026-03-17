@@ -12,11 +12,20 @@ namespace Biologic.SequenceItems;
 /// </summary>
 public class GEISSequenceItem : SequenceItem
 {
-  private const float DefaultRecordEveryDt = 0.1f;
-  private const float DefaultRecordEveryDe = 0.001f;
-  private const float DefaultWaitForSteady = 0.1f;
+  private const float DefaultRecordEveryDt = 0.0f;
+  private const float DefaultRecordEveryDe = 0.0f;
+  private const float DefaultWaitForSteady = 0.0f;
+  private const float DefaultDurationStep = 1.0f;
+  private const float DefaultNonZeroCurrentStep = 1e-6f;
+  private const float DefaultConservativeAmplitude = 10e-6f;
+  private const float DefaultConservativeInitialFrequency = 10000.0f;
+  private const float DefaultConservativeFinalFrequency = 1.0f;
+  private const int DefaultConservativeFrequencyPoints = 10;
+  private const float DefaultConservativeWaitForSteady = 1.0f;
+  private const int DefaultAverageCount = 1;
   private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
   private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
+  private static readonly TimeSpan StopWaitTimeout = TimeSpan.FromSeconds(5);
 
   private int _deviceId;
   private byte _channelIndex;
@@ -27,6 +36,7 @@ public class GEISSequenceItem : SequenceItem
   private float _acAmplitude_A;
   private string? _outputFile;
   private Dictionary<string, object>? _parameters;
+  private ECLabDevice? _device;
 
   public override void Initialize(Sequence.StateContext context)
   {
@@ -56,8 +66,9 @@ public class GEISSequenceItem : SequenceItem
 
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
-    if (device != null && device.GetProperty("DeviceId") is int deviceId)
+    if (device is ECLabDevice ecLabDevice && device.GetProperty("DeviceId") is int deviceId)
     {
+      _device = ecLabDevice;
       _deviceId = deviceId;
     }
     else
@@ -71,26 +82,23 @@ public class GEISSequenceItem : SequenceItem
       throw new InvalidOperationException($"Channel {_channelIndex} does not support impedance techniques (Zboard == 0)");
     }
 
-    int currentRange = SelectCurrentRange(Math.Abs(_dcCurrent_A) + Math.Abs(_acAmplitude_A));
+    var currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
+    Log.Information(
+      "Channel {Channel} live ranges before GEIS: Ewe={Ewe}V, ERange=[{Min}V, {Max}V], I={Current}A, IRange={IRange}",
+      _channelIndex,
+      currentValues.Ewe,
+      currentValues.EweRangeMin,
+      currentValues.EweRangeMax,
+      currentValues.I,
+      currentValues.IRange);
 
-    // GEIS parameter labels are case-sensitive and must match the vendor manual.
-    _parameters = new Dictionary<string, object>
-    {
-      ["vs_initializer"] = false,
-      ["Initial_Current_step"] = _dcCurrent_A,
-      ["Duration_step"] = 0.0f,
-      ["Record EVERY_dT"] = DefaultRecordEveryDt,
-      ["Record EVERY_dE"] = DefaultRecordEveryDe,
-      ["Final_freqency"] = _finalFrequency_Hz,
-      ["Initial_freqency"] = _initialFrequency_Hz,
-      ["sweep"] = false,
-      ["Amplitude_Current"] = _acAmplitude_A,
-      ["Frequency_number"] = _frequencyPoints,
-      ["Average_N(times"] = 1,
-      ["Correction"] = false,
-      ["Wait_for_steady"] = DefaultWaitForSteady,
-      ["I_Range"] = currentRange
-    };
+    _parameters = this.BuildGeisParameters(
+      currentStep: _dcCurrent_A,
+      amplitudeCurrent: _acAmplitude_A,
+      initialFrequency: _initialFrequency_Hz,
+      finalFrequency: _finalFrequency_Hz,
+      frequencyNumber: _frequencyPoints,
+      iRange: SelectCurrentRange(Math.Abs(_dcCurrent_A) + Math.Abs(_acAmplitude_A)));
   }
 
   public override Sequence.ResultTypes Execute(Sequence.StateContext context)
@@ -100,100 +108,58 @@ public class GEISSequenceItem : SequenceItem
       Log.Information("Starting GEIS on channel {Channel}: {InitFreq}Hz to {FinalFreq}Hz, {Points} points",
         _channelIndex, _initialFrequency_Hz, _finalFrequency_Hz, _frequencyPoints);
 
-      string eccPath = ResolveTechniquePath("geis.ecc");
-
-      if (!File.Exists(eccPath))
+      if (_device == null || !_device.IsConnected || _device.DeviceId < 0)
       {
-        throw new FileNotFoundException($"Technique file not found: {eccPath}");
+        throw new InvalidOperationException("Device is not connected");
       }
 
-      // Create EccParams structure
-      var eccParams = new EccParams
+      this.EnsureChannelStoppedBeforeLoading();
+
+      this.LoadGeisTechniqueWithFallbacks("geis.ecc");
+
+      ECLibApi.StartChannel(_deviceId, _channelIndex + 1);
+
+      Log.Information("GEIS started successfully on channel {Channel}", _channelIndex);
+
+      uint boardType = (uint)ECLibApi.GetChannelBoardType(_deviceId, _channelIndex + 1);
+      var processZeroPoints = new List<object>();
+      var spectrumPoints = CollectSpectrumPoints(context, boardType, processZeroPoints);
+
+      if (spectrumPoints.Count == 0)
       {
-        len = 0,
-        pParams = IntPtr.Zero
-      };
-
-      // Build parameter array
-      if (_parameters != null && _parameters.Count > 0)
-      {
-        var paramArray = BuildEccParamArray(_parameters);
-        eccParams.len = paramArray.Length;
-
-        int paramSize = System.Runtime.InteropServices.Marshal.SizeOf<EccParam>();
-        eccParams.pParams = System.Runtime.InteropServices.Marshal.AllocHGlobal(paramSize * paramArray.Length);
-
-        for (int i = 0; i < paramArray.Length; i++)
-        {
-          IntPtr ptr = IntPtr.Add(eccParams.pParams, i * paramSize);
-          System.Runtime.InteropServices.Marshal.StructureToPtr(paramArray[i], ptr, false);
-        }
-      }
-
-      try
-      {
-        // Load technique
-        ECLibApi.LoadTechnique(
-          _deviceId,
-          _channelIndex + 1,
-          eccPath,
-          ref eccParams,
-          first: true,
-          last: true,
-          display: false);
-
-        // Start channel
-        ECLibApi.StartChannel(_deviceId, _channelIndex + 1);
-
-        Log.Information("GEIS started successfully on channel {Channel}", _channelIndex);
-
-        uint boardType = (uint)ECLibApi.GetChannelBoardType(_deviceId, _channelIndex + 1);
-        var processZeroPoints = new List<object>();
-        var spectrumPoints = CollectSpectrumPoints(context, boardType, processZeroPoints);
-
-        if (spectrumPoints.Count == 0)
-        {
-          context.ResultParameter = new
-          {
-            Success = false,
-            Message = $"GEIS completed on channel {_channelIndex}, but no process 1 spectrum points were returned by BL_GetData.",
-            ChannelIndex = _channelIndex,
-            WarmupPoints = processZeroPoints
-          };
-
-          return Sequence.ResultTypes.Error;
-        }
-
-        if (!string.IsNullOrWhiteSpace(_outputFile))
-        {
-          WriteSpectrumCsv(_outputFile!, spectrumPoints);
-        }
-
         context.ResultParameter = new
         {
-          Success = true,
-          Message = $"GEIS completed on channel {_channelIndex}",
+          Success = false,
+          Message = $"GEIS completed on channel {_channelIndex}, but no process 1 spectrum points were returned by BL_GetData.",
           ChannelIndex = _channelIndex,
-          InitialFrequency_Hz = _initialFrequency_Hz,
-          FinalFrequency_Hz = _finalFrequency_Hz,
-          FrequencyPoints = _frequencyPoints,
-          DcCurrent_A = _dcCurrent_A,
-          AcAmplitude_A = _acAmplitude_A,
-          SpectrumPointCount = spectrumPoints.Count,
-          Spectrum = spectrumPoints,
-          WarmupPoints = processZeroPoints,
-          OutputFile = _outputFile
+          WarmupPoints = processZeroPoints
         };
 
-        return Sequence.ResultTypes.Next;
+        return Sequence.ResultTypes.Error;
       }
-      finally
+
+      if (!string.IsNullOrWhiteSpace(_outputFile))
       {
-        if (eccParams.pParams != IntPtr.Zero)
-        {
-          System.Runtime.InteropServices.Marshal.FreeHGlobal(eccParams.pParams);
-        }
+        WriteSpectrumCsv(_outputFile!, spectrumPoints);
       }
+
+      context.ResultParameter = new
+      {
+        Success = true,
+        Message = $"GEIS completed on channel {_channelIndex}",
+        ChannelIndex = _channelIndex,
+        InitialFrequency_Hz = _initialFrequency_Hz,
+        FinalFrequency_Hz = _finalFrequency_Hz,
+        FrequencyPoints = _frequencyPoints,
+        DcCurrent_A = _dcCurrent_A,
+        AcAmplitude_A = _acAmplitude_A,
+        SpectrumPointCount = spectrumPoints.Count,
+        Spectrum = spectrumPoints,
+        WarmupPoints = processZeroPoints,
+        OutputFile = _outputFile
+      };
+
+      return Sequence.ResultTypes.Next;
     }
     catch (ECLibException ex)
     {
@@ -361,22 +327,6 @@ public class GEISSequenceItem : SequenceItem
     }
   }
 
-  private static string ResolveTechniquePath(string techniqueFileName)
-  {
-    string[] candidatePaths =
-    [
-      Path.Combine(Directory.GetCurrentDirectory(), "lib", techniqueFileName),
-      Path.Combine(Directory.GetCurrentDirectory(), "Techniques", techniqueFileName),
-      Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "lib", techniqueFileName),
-      Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Techniques", techniqueFileName),
-      Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EC-Lab Development Package", "lib", techniqueFileName),
-      Path.Combine(AppContext.BaseDirectory, "lib", techniqueFileName)
-    ];
-
-    return candidatePaths.FirstOrDefault(File.Exists)
-      ?? candidatePaths[0];
-  }
-
   private static int SelectCurrentRange(float requestedCurrentA)
   {
     float safeCurrent = Math.Max(requestedCurrentA * 2.0f, 100e-12f);
@@ -428,43 +378,277 @@ public class GEISSequenceItem : SequenceItem
   private EccParam[] BuildEccParamArray(Dictionary<string, object> parameters)
   {
     var paramList = new List<EccParam>();
-    int index = 0;
 
-    foreach (var kvp in parameters)
+    if (parameters.ContainsKey("vs_initializer"))
     {
-      var param = new EccParam
-      {
-        ParamStr = System.Text.Encoding.ASCII.GetBytes(kvp.Key.PadRight(64, '\0')),
-        ParamIndex = index++
-      };
+      paramList.Add(ECLibApi.DefineBoolParameter("vs_initializer", Convert.ToBoolean(parameters["vs_initializer"]), 0));
+    }
 
-      var value = kvp.Value;
-      if (value is bool boolValue)
-      {
-        param.ParamType = (int)PARAM_TYPE.PARAM_BOOLEAN;
-        param.ParamVal = boolValue ? 1 : 0;
-      }
-      else if (value is int intValue)
-      {
-        param.ParamType = (int)PARAM_TYPE.PARAM_INT;
-        param.ParamVal = intValue;
-      }
-      else if (value is float floatValue)
-      {
-        param.ParamType = (int)PARAM_TYPE.PARAM_SINGLE;
-        param.ParamVal = BitConverter.ToInt32(BitConverter.GetBytes(floatValue), 0);
-      }
-      else if (value is double doubleValue)
-      {
-        param.ParamType = (int)PARAM_TYPE.PARAM_SINGLE;
-        float f = (float)doubleValue;
-        param.ParamVal = BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
-      }
+    if (parameters.ContainsKey("Initial_Current_step"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Initial_Current_step", Convert.ToSingle(parameters["Initial_Current_step"]), 0));
+    }
 
-      paramList.Add(param);
+    if (parameters.ContainsKey("Duration_step"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Duration_step", Convert.ToSingle(parameters["Duration_step"]), 0));
+    }
+
+    if (parameters.ContainsKey("Record EVERY_dT"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Record EVERY_dT", Convert.ToSingle(parameters["Record EVERY_dT"]), 0));
+    }
+
+    if (parameters.ContainsKey("Record_every_dT"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Record_every_dT", Convert.ToSingle(parameters["Record_every_dT"]), 0));
+    }
+
+    if (parameters.ContainsKey("Record EVERY_dE"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Record EVERY_dE", Convert.ToSingle(parameters["Record EVERY_dE"]), 0));
+    }
+
+    if (parameters.ContainsKey("Record_every_dE"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Record_every_dE", Convert.ToSingle(parameters["Record_every_dE"]), 0));
+    }
+
+    if (parameters.ContainsKey("Final_frequency"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Final_frequency", Convert.ToSingle(parameters["Final_frequency"]), 0));
+    }
+
+    if (parameters.ContainsKey("Final_freqency"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Final_freqency", Convert.ToSingle(parameters["Final_freqency"]), 0));
+    }
+
+    if (parameters.ContainsKey("Initial_frequency"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Initial_frequency", Convert.ToSingle(parameters["Initial_frequency"]), 0));
+    }
+
+    if (parameters.ContainsKey("Initial_freqency"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Initial_freqency", Convert.ToSingle(parameters["Initial_freqency"]), 0));
+    }
+
+    if (parameters.ContainsKey("sweep"))
+    {
+      paramList.Add(ECLibApi.DefineBoolParameter("sweep", Convert.ToBoolean(parameters["sweep"]), 0));
+    }
+
+    if (parameters.ContainsKey("Amplitude_Current"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Amplitude_Current", Convert.ToSingle(parameters["Amplitude_Current"]), 0));
+    }
+
+    if (parameters.ContainsKey("Frequency_number"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("Frequency_number", Convert.ToInt32(parameters["Frequency_number"]), 0));
+    }
+
+    if (parameters.ContainsKey("Average_N_times"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("Average_N_times", Convert.ToInt32(parameters["Average_N_times"]), 0));
+    }
+
+    if (parameters.ContainsKey("Average_N(times"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("Average_N(times", Convert.ToInt32(parameters["Average_N(times"]), 0));
+    }
+
+    if (parameters.ContainsKey("Average_N(times)"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("Average_N(times)", Convert.ToInt32(parameters["Average_N(times)"]), 0));
+    }
+
+    if (parameters.ContainsKey("Correction"))
+    {
+      paramList.Add(ECLibApi.DefineBoolParameter("Correction", Convert.ToBoolean(parameters["Correction"]), 0));
+    }
+
+    if (parameters.ContainsKey("Wait_for_steady"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Wait_for_steady", Convert.ToSingle(parameters["Wait_for_steady"]), 0));
+    }
+
+    if (parameters.ContainsKey("I_Range"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("I_Range", Convert.ToInt32(parameters["I_Range"]), 0));
+    }
+
+    if (parameters.ContainsKey("E_Range"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("E_Range", Convert.ToInt32(parameters["E_Range"]), 0));
+    }
+
+    if (parameters.ContainsKey("vs_initial"))
+    {
+      paramList.Add(ECLibApi.DefineBoolParameter("vs_initial", Convert.ToBoolean(parameters["vs_initial"]), 0));
+    }
+
+    if (parameters.ContainsKey("Is_initial"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Is_initial", Convert.ToSingle(parameters["Is_initial"]), 0));
+    }
+
+    if (parameters.ContainsKey("Is_final"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Is_final", Convert.ToSingle(parameters["Is_final"]), 0));
+    }
+
+    if (parameters.ContainsKey("Duration"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Duration", Convert.ToSingle(parameters["Duration"]), 0));
+    }
+
+    if (parameters.ContainsKey("Ia"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("Ia", Convert.ToSingle(parameters["Ia"]), 0));
+    }
+
+    if (parameters.ContainsKey("freq_init"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("freq_init", Convert.ToSingle(parameters["freq_init"]), 0));
+    }
+
+    if (parameters.ContainsKey("freq_final"))
+    {
+      paramList.Add(ECLibApi.DefineSingleParameter("freq_final", Convert.ToSingle(parameters["freq_final"]), 0));
+    }
+
+    if (parameters.ContainsKey("Points_per_decade"))
+    {
+      paramList.Add(ECLibApi.DefineIntParameter("Points_per_decade", Convert.ToInt32(parameters["Points_per_decade"]), 0));
     }
 
     return paramList.ToArray();
+  }
+
+  private void LoadGeisTechniqueWithFallbacks(string preferredTechniqueFile)
+  {
+    string eccPath = _device!.ResolveTechniqueFilePath(preferredTechniqueFile, _channelIndex);
+    if (!File.Exists(eccPath))
+    {
+      throw new FileNotFoundException($"GEIS technique file not found: {eccPath}", eccPath);
+    }
+
+    string nativeEccPath = _device.GetNativeTechniqueFilePath(preferredTechniqueFile, _channelIndex);
+    this.ResetChannelBeforeGeisAttempt();
+
+    var eccParams = new EccParams
+    {
+      len = 0,
+      pParams = IntPtr.Zero
+    };
+
+    try
+    {
+      var paramArray = BuildEccParamArray(_parameters ?? this.BuildGeisParameters(
+        currentStep: _dcCurrent_A,
+        amplitudeCurrent: _acAmplitude_A,
+        initialFrequency: _initialFrequency_Hz,
+        finalFrequency: _finalFrequency_Hz,
+        frequencyNumber: _frequencyPoints,
+        iRange: SelectCurrentRange(Math.Abs(_dcCurrent_A) + Math.Abs(_acAmplitude_A))));
+      eccParams.len = paramArray.Length;
+
+      int paramSize = System.Runtime.InteropServices.Marshal.SizeOf<EccParam>();
+      eccParams.pParams = System.Runtime.InteropServices.Marshal.AllocHGlobal(paramSize * paramArray.Length);
+      for (int i = 0; i < paramArray.Length; i++)
+      {
+        IntPtr ptr = IntPtr.Add(eccParams.pParams, i * paramSize);
+        System.Runtime.InteropServices.Marshal.StructureToPtr(paramArray[i], ptr, false);
+      }
+
+      ECLibApi.LoadTechnique(
+        _deviceId,
+        _channelIndex + 1,
+        nativeEccPath,
+        ref eccParams,
+        first: true,
+        last: true,
+        display: false);
+    }
+    finally
+    {
+      if (eccParams.pParams != IntPtr.Zero)
+      {
+        System.Runtime.InteropServices.Marshal.FreeHGlobal(eccParams.pParams);
+      }
+    }
+  }
+
+  private Dictionary<string, object> BuildGeisParameters(
+    float currentStep,
+    float amplitudeCurrent,
+    float initialFrequency,
+    float finalFrequency,
+    int frequencyNumber,
+    int iRange,
+    bool sweep = false)
+  {
+    var parameters = new Dictionary<string, object>
+    {
+      ["vs_initial"] = false,
+      ["Initial_Current_step"] = currentStep,
+      ["Duration_step"] = Convert.ToSingle(Properties?.GetValueOrDefault("Duration_step") ?? DefaultDurationStep),
+      ["Record_every_dT"] = Convert.ToSingle(Properties?.GetValueOrDefault("Record_every_dT") ?? DefaultRecordEveryDt),
+      ["Record_every_dE"] = Convert.ToSingle(Properties?.GetValueOrDefault("Record_every_dE") ?? DefaultRecordEveryDe),
+      ["Final_frequency"] = finalFrequency,
+      ["Initial_frequency"] = initialFrequency,
+      ["sweep"] = sweep,
+      ["Amplitude_Current"] = amplitudeCurrent,
+      ["Frequency_number"] = frequencyNumber,
+      ["Average_N_times"] = Convert.ToInt32(Properties?.GetValueOrDefault("Average_N_times") ?? DefaultAverageCount),
+      ["Correction"] = Convert.ToBoolean(Properties?.GetValueOrDefault("Correction") ?? false),
+      ["Wait_for_steady"] = Convert.ToSingle(Properties?.GetValueOrDefault("Wait_for_steady") ?? DefaultWaitForSteady),
+      ["I_Range"] = iRange
+    };
+
+    return parameters;
+  }
+
+  private void EnsureChannelStoppedBeforeLoading()
+  {
+    var currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
+    if ((PROG_STATE)currentValues.State == PROG_STATE.STOP)
+    {
+      return;
+    }
+
+    Log.Information("Stopping channel {Channel} before loading GEIS because current state is {State}", _channelIndex, (PROG_STATE)currentValues.State);
+    ECLibApi.StopChannel(_deviceId, _channelIndex + 1);
+
+    DateTime deadline = DateTime.UtcNow + StopWaitTimeout;
+    while (DateTime.UtcNow < deadline)
+    {
+      currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
+      if ((PROG_STATE)currentValues.State == PROG_STATE.STOP)
+      {
+        return;
+      }
+
+      Thread.Sleep(TimeSpan.FromMilliseconds(100));
+    }
+
+    throw new TimeoutException($"Channel {_channelIndex} did not reach STOP before GEIS loading.");
+  }
+
+  private void ResetChannelBeforeGeisAttempt()
+  {
+    if (_device == null)
+    {
+      throw new InvalidOperationException("GEIS device context is not available for channel reset.");
+    }
+
+    bool resetSucceeded = _device.ResetChannelTechniqueState(_channelIndex, forceFirmwareReload: true);
+    if (!resetSucceeded)
+    {
+      throw new InvalidOperationException($"Failed to reset channel {_channelIndex} before GEIS attempt.");
+    }
   }
 
   private sealed class GeisSpectrumPoint

@@ -498,6 +498,60 @@ FirmwareLoaded:
   }
 
   /// <summary>
+  /// Force a clean channel state by stopping execution and reloading firmware.
+  /// This is used when technique loading leaves residual protocol state on the channel.
+  /// </summary>
+  public bool ResetChannelTechniqueState(byte channel, bool forceFirmwareReload = true)
+  {
+    if (!this.communication.IsOpen)
+    {
+      Log.Error("Cannot reset channel {Channel}: device not connected", channel);
+      return false;
+    }
+
+    Log.Information(
+      "Resetting channel {Channel} technique state. ForceFirmwareReload={ForceFirmwareReload}",
+      channel,
+      forceFirmwareReload);
+
+    try
+    {
+      try
+      {
+        ECLibApi.StopChannel(this.communication.DeviceId, channel + 1);
+      }
+      catch (ECLibException ex)
+      {
+        Log.Warning("StopChannel during reset for channel {Channel} reported: {Error}", channel, ex.Message);
+      }
+
+      bool loaded = this.LoadFirmware(channel, force: forceFirmwareReload, showGauge: false);
+      if (!loaded)
+      {
+        Log.Error("Channel {Channel} reset failed because firmware reload did not succeed", channel);
+        return false;
+      }
+
+      try
+      {
+        var info = ECLibApi.GetChannelInfo(this.communication.DeviceId, channel + 1);
+        this.channelInfos[channel] = info;
+      }
+      catch (ECLibException ex)
+      {
+        Log.Warning("Channel {Channel} reset completed but channel info refresh failed: {Error}", channel, ex.Message);
+      }
+
+      return true;
+    }
+    catch (Exception ex)
+    {
+      Log.Error(ex, "Unexpected error while resetting channel {Channel} technique state", channel);
+      return false;
+    }
+  }
+
+  /// <summary>
   /// Load firmware to all plugged channels
   /// </summary>
   /// <param name="force">Force firmware reload</param>

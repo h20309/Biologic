@@ -1,4 +1,5 @@
 using System.Text;
+using System.Runtime.InteropServices;
 using Serilog;
 
 namespace Biologic.Native;
@@ -448,6 +449,56 @@ public class ECLibApi
       last,
       display);
     CheckError(errorCode, $"LoadTechnique for device {deviceId}, channel {channel}");
+  }
+
+  public static TechniqueInfos GetTechniqueInfos(int deviceId, int channel, int index)
+  {
+    byte channelByte = (byte)(channel - 1);
+    int errorCode = ECLibNative.BL_GetTechniqueInfos(deviceId, channelByte, index, out TechniqueInfos infos);
+    CheckError(errorCode, $"GetTechniqueInfos for device {deviceId}, channel {channel}, index {index}");
+    return infos;
+  }
+
+  public static TechniqueInfos GetParamInfos(int deviceId, int channel, int index)
+  {
+    byte channelByte = (byte)(channel - 1);
+    int errorCode = ECLibNative.BL_GetParamInfos(deviceId, channelByte, index, out TechniqueInfos infos);
+    CheckError(errorCode, $"GetParamInfos for device {deviceId}, channel {channel}, index {index}");
+    return infos;
+  }
+
+  public static IReadOnlyList<EccParam> ReadTechniqueParams(TechniqueInfos infos)
+  {
+    var parameters = new List<EccParam>();
+    if (infos.nbParams <= 0 || infos.Params == IntPtr.Zero)
+    {
+      return parameters;
+    }
+
+    int size = Marshal.SizeOf<EccParam>();
+    for (int i = 0; i < infos.nbParams; i++)
+    {
+      IntPtr current = IntPtr.Add(infos.Params, i * size);
+      parameters.Add(Marshal.PtrToStructure<EccParam>(current));
+    }
+
+    return parameters;
+  }
+
+  public static string GetEccParamLabel(EccParam parameter)
+  {
+    return Encoding.ASCII.GetString(parameter.ParamStr).TrimEnd('\0');
+  }
+
+  public static string FormatEccParamValue(EccParam parameter)
+  {
+    return parameter.ParamType switch
+    {
+      (int)PARAM_TYPE.PARAM_BOOLEAN => (parameter.ParamVal != 0).ToString(),
+      (int)PARAM_TYPE.PARAM_INT => parameter.ParamVal.ToString(),
+      (int)PARAM_TYPE.PARAM_SINGLE => BitConverter.ToSingle(BitConverter.GetBytes(parameter.ParamVal), 0).ToString("G9"),
+      _ => parameter.ParamVal.ToString()
+    };
   }
 
   #endregion

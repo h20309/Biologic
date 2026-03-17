@@ -17,6 +17,7 @@ public class DischargeSequenceItem : SequenceItem
   private float _duration_s;
   private float _cutoffVoltage_V;
   private Dictionary<string, object>? _parameters;
+  private ECLabDevice? _device;
 
   public override void Initialize(Sequence.StateContext context)
   {
@@ -30,8 +31,9 @@ public class DischargeSequenceItem : SequenceItem
 
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
-    if (device != null && device.GetProperty("DeviceId") is int deviceId)
+    if (device is ECLabDevice ecLabDevice && device.GetProperty("DeviceId") is int deviceId)
     {
+      _device = ecLabDevice;
       _deviceId = deviceId;
     }
     else
@@ -55,19 +57,27 @@ public class DischargeSequenceItem : SequenceItem
   {
     try
     {
+      if (_device == null || !_device.IsConnected || _device.DeviceId < 0)
+      {
+        throw new InvalidOperationException("Device is not connected");
+      }
+
       Log.Information("Starting discharge on channel {Channel}: Current={Current}A, Duration={Duration}s, Cutoff={Cutoff}V",
         _channelIndex, _current_A, _duration_s, _cutoffVoltage_V);
 
       // Load CA technique
-      string eccPath = Path.Combine(
-        AppDomain.CurrentDomain.BaseDirectory,
-        "Techniques",
-        "ca.ecc");
+      string eccPath = _device.ResolveTechniqueFilePath("ca.ecc", _channelIndex);
+      string nativeEccPath = _device.GetNativeTechniqueFilePath("ca.ecc", _channelIndex);
 
       if (!File.Exists(eccPath))
       {
         throw new FileNotFoundException($"Technique file not found: {eccPath}");
       }
+
+      Log.Information(
+        "Resolved discharge technique path: {TechniquePath} (native path: {NativeTechniquePath})",
+        eccPath,
+        nativeEccPath);
 
       // Create EccParams structure
       var eccParams = new EccParams
@@ -98,7 +108,7 @@ public class DischargeSequenceItem : SequenceItem
         ECLibApi.LoadTechnique(
           _deviceId,
           _channelIndex + 1,
-          eccPath,
+          nativeEccPath,
           ref eccParams,
           first: true,
           last: true,

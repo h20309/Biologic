@@ -28,6 +28,17 @@ public class ConnectDeviceSequenceItem : SequenceItem
 
       Log.Information("Connecting to ECLab device");
 
+      if (ecLabDevice.IsConnected && ecLabDevice.HasAvailableChannels)
+      {
+        Log.Information(
+          "ECLab device is already connected and initialized with {ChannelCount} channel(s); skipping duplicate connect",
+          ecLabDevice.GetProperty("ChannelCount"));
+
+        DeviceControlSoftware.MethodParameters.ResultData alreadyConnected = new(true, "Device already connected");
+        context.ResultParameter = alreadyConnected;
+        return Sequence.ResultTypes.Next;
+      }
+
       // Open device (this will open communication and initialize)
       ecLabDevice.Open();
 

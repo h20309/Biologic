@@ -413,6 +413,26 @@ internal static class ECLibNative
       ref EccParams parameters,
       [MarshalAs(UnmanagedType.LPStr)] string eccFile);
 
+  /// <summary>
+  /// Retrieve metadata for a loaded technique.
+  /// </summary>
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+  internal static extern int BL_GetTechniqueInfos(
+      int id,
+      byte channel,
+      int index,
+      out TechniqueInfos infos);
+
+  /// <summary>
+  /// Retrieve parameter metadata for a loaded technique.
+  /// </summary>
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+  internal static extern int BL_GetParamInfos(
+      int id,
+      byte channel,
+      int index,
+      out TechniqueInfos infos);
+
   #endregion
 
   #region Channel Control
