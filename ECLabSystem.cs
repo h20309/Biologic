@@ -1,5 +1,6 @@
 using Biologic.Communications;
 using Biologic.Devices;
+using Biologic.Native;
 using Biologic.SequenceItems;
 using DeviceControlSoftware;
 using System.Text.Json;
@@ -23,18 +24,30 @@ public class ECLabSystem : SequenceDispatcher
 
   protected override void Setup()
   {
+    var eclabSettings = this.Settings?.Properties.TryGetValue("EC-LAB", out var ecLabProperties) == true
+      ? ecLabProperties
+      : null;
+
     // Get device configuration from settings
-    string deviceName = this.Settings?.Properties["EC-LAB"]?["DeviceName"]?.ToString() ?? "EC-LAB";
-    string address = this.Settings?.Properties["EC-LAB"]?["Address"]?.ToString() ?? "USB0";
-    int timeoutMs = int.Parse(this.Settings?.Properties["EC-LAB"]?["TimeoutMs"]?.ToString() ?? "5000");
-    string? techniquesPath = this.Settings?.Properties["EC-LAB"]?["TechniquesPath"]?.ToString();
+    string deviceName = eclabSettings?.GetValueOrDefault("DeviceName")?.ToString() ?? "EC-LAB";
+    string address = eclabSettings?.GetValueOrDefault("Address")?.ToString() ?? "USB0";
+    int timeoutMs = int.Parse(eclabSettings?.GetValueOrDefault("TimeoutMs")?.ToString() ?? "5000");
+    string? techniquesPath = eclabSettings?.GetValueOrDefault("TechniquesPath")?.ToString();
+    string? eclibDirectory = eclabSettings?.GetValueOrDefault("ECLibDirectory")?.ToString()
+      ?? eclabSettings?.GetValueOrDefault("LibraryPath")?.ToString();
 
     // Create communication
     this.communication = new ECLabCommunication(address, timeoutMs);
 
     // Create device with techniques path from configuration
     // TechniquesPath contains both technique files and firmware files
-    this.device = new ECLabDevice(this.communication, techniquesPath);
+    this.device = new ECLabDevice(
+      this.communication,
+      techniquesPath,
+      eclibDirectory,
+      Directory.GetCurrentDirectory());
+
+    this.ConfigureNativeLibraryDirectory(this.device.ECLibDirectory);
 
     // Register device with configured name (from setting.json)
     // This name must match the node name in OPC UA NodeSet XML file
@@ -85,5 +98,28 @@ public class ECLabSystem : SequenceDispatcher
   protected ECLabDevice? GetECLabDevice()
   {
     return this.device;
+  }
+
+  private void ConfigureNativeLibraryDirectory(string libraryDirectory)
+  {
+    if (string.IsNullOrWhiteSpace(libraryDirectory) || !Directory.Exists(libraryDirectory))
+    {
+      return;
+    }
+
+    ECLibNative.ConfigurePreferredLibraryDirectory(libraryDirectory);
+
+    string currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+    string[] pathEntries = currentPath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+    if (pathEntries.Any(entry => string.Equals(entry, libraryDirectory, StringComparison.OrdinalIgnoreCase)))
+    {
+      return;
+    }
+
+    string updatedPath = string.IsNullOrWhiteSpace(currentPath)
+      ? libraryDirectory
+      : string.Join(Path.PathSeparator, new[] { libraryDirectory, currentPath });
+
+    Environment.SetEnvironmentVariable("PATH", updatedPath);
   }
 }

@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Text;
 
 namespace Biologic.Native;
@@ -23,6 +24,63 @@ namespace Biologic.Native;
 internal static class ECLibNative
 {
   private const string DllName = "EClib64.dll";
+    private static readonly object ResolverSync = new();
+    private static string? preferredLibraryDirectory;
+    private static IntPtr preferredLibraryHandle;
+    private static bool resolverRegistered;
+
+    internal static void ConfigurePreferredLibraryDirectory(string libraryDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(libraryDirectory) || !Directory.Exists(libraryDirectory))
+        {
+            return;
+        }
+
+        lock (ResolverSync)
+        {
+            preferredLibraryDirectory = Path.GetFullPath(libraryDirectory);
+
+            if (!resolverRegistered)
+            {
+                NativeLibrary.SetDllImportResolver(typeof(ECLibNative).Assembly, ResolveLibraryImport);
+                resolverRegistered = true;
+            }
+
+            string preferredLibraryPath = Path.Combine(preferredLibraryDirectory, DllName);
+            if (File.Exists(preferredLibraryPath))
+            {
+                preferredLibraryHandle = NativeLibrary.Load(preferredLibraryPath);
+            }
+        }
+    }
+
+    private static IntPtr ResolveLibraryImport(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (!string.Equals(libraryName, DllName, StringComparison.OrdinalIgnoreCase))
+        {
+            return IntPtr.Zero;
+        }
+
+        lock (ResolverSync)
+        {
+            if (preferredLibraryHandle != IntPtr.Zero)
+            {
+                return preferredLibraryHandle;
+            }
+
+            if (!string.IsNullOrWhiteSpace(preferredLibraryDirectory))
+            {
+                string preferredLibraryPath = Path.Combine(preferredLibraryDirectory, DllName);
+                if (File.Exists(preferredLibraryPath))
+                {
+                    preferredLibraryHandle = NativeLibrary.Load(preferredLibraryPath);
+                    return preferredLibraryHandle;
+                }
+            }
+        }
+
+        return IntPtr.Zero;
+    }
 
   #region Connection Management
 
@@ -140,6 +198,26 @@ internal static class ECLibNative
       StringBuilder message,
       int size);
 
+  /// <summary>
+  /// Get pending firmware/channel message text.
+  /// </summary>
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
+  internal static extern int BL_GetMessage(
+      int id,
+      byte channel,
+      StringBuilder message,
+      ref uint size);
+
+  /// <summary>
+  /// Get current option error information for a channel.
+  /// </summary>
+  [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+  internal static extern int BL_GetOptErr(
+      int id,
+      byte channel,
+      out int optError,
+      out int optPos);
+
   #endregion
 
   #region Firmware Management
@@ -153,19 +231,25 @@ internal static class ECLibNative
       [MarshalAs(UnmanagedType.LPTStr)] StringBuilder lpszShortPath,
       int cchBuffer);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern int GetModuleFileName(IntPtr hModule, StringBuilder lpFilename, int nSize);
+
   /// <summary>
   /// Load firmware to specified channels
   /// </summary>
   [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
   internal static extern int BL_LoadFirmware(
       int id,
-      [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] bool[] channels,
+      [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] byte[] channels,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] int[] results,
       byte length,
       [MarshalAs(UnmanagedType.Bool)] bool showGauge,
       [MarshalAs(UnmanagedType.Bool)] bool forceReload,
-      [MarshalAs(UnmanagedType.LPStr)] string firmwarePath,
-      [MarshalAs(UnmanagedType.LPStr)] string fpgaPath);
+      [MarshalAs(UnmanagedType.LPStr)] string? firmwarePath,
+      [MarshalAs(UnmanagedType.LPStr)] string? fpgaPath);
 
   /// <summary>
   /// Convert long path to short path (8.3 format) for better compatibility
@@ -201,6 +285,34 @@ internal static class ECLibNative
     
     return shortPath.ToString();
   }
+
+    internal static string? GetLoadedModulePath(string moduleName)
+    {
+        IntPtr moduleHandle = GetModuleHandle(moduleName);
+        if (moduleHandle == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        StringBuilder buffer = new StringBuilder(260);
+        int result = GetModuleFileName(moduleHandle, buffer, buffer.Capacity);
+        if (result == 0)
+        {
+            return null;
+        }
+
+        if (result >= buffer.Capacity)
+        {
+            buffer = new StringBuilder(1024);
+            result = GetModuleFileName(moduleHandle, buffer, buffer.Capacity);
+            if (result == 0)
+            {
+                return null;
+            }
+        }
+
+        return buffer.ToString();
+    }
 
   /// <summary>
   /// Load flash firmware
@@ -317,7 +429,7 @@ internal static class ECLibNative
   [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_StartChannels(
       int id,
-      [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] bool[] channels,
+      [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] byte[] channels,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] int[] results,
       byte length);
 
@@ -333,7 +445,7 @@ internal static class ECLibNative
   [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
   internal static extern int BL_StopChannels(
       int id,
-      [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] bool[] channels,
+      [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] byte[] channels,
       [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] int[] results,
       byte length);
 

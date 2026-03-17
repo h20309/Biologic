@@ -1,3 +1,4 @@
+using Biologic;
 using Biologic.Communications;
 using Biologic.Native;
 using DeviceControlSoftware;
@@ -12,26 +13,44 @@ namespace Biologic.Devices;
 public class ECLabDevice : Device
 {
   public static readonly string DeviceName = "EC-LAB";
+  private const int FirmwareLoadRetryCount = 3;
+  private const int FirmwareLoadRetryDelayMs = 1500;
+  private const bool ForceFirmwareReloadOnOpen = true;
 
   private readonly ECLabCommunication communication;
   private readonly Dictionary<byte, ChannelInfo> channelInfos = new();
+  private readonly ECLabPathResolver pathResolver;
   private BOARD_TYPE boardType = BOARD_TYPE.ESSENTIAL;
   private readonly string? techniquesPath;
+  private readonly string? eclibDirectory;
+  private bool isInitialized;
 
   public override string Name => DeviceName;
 
-  public override bool IsBusy => false; // TODO: Implement based on channel states
+  public override bool IsBusy => this.communication.IsBusyConnection;
 
-  public bool IsConnected => this.communication.IsOpen;
+  public new bool IsConnected => this.communication.IsOpen;
+
+  public bool IsInitialized => this.isInitialized;
+
+  public bool HasAvailableChannels => this.channelInfos.Count > 0;
 
   public int DeviceId => this.communication.DeviceId;
 
   public string TechniquesPath => this.GetTechniquesDirectory();
 
-  public ECLabDevice(ECLabCommunication communication, string? techniquesPath = null)
+  public string ECLibDirectory => this.GetECLibDirectory();
+
+  public ECLabDevice(
+    ECLabCommunication communication,
+    string? techniquesPath = null,
+    string? eclibDirectory = null,
+    string? configurationRoot = null)
   {
     this.communication = communication ?? throw new ArgumentNullException(nameof(communication));
     this.techniquesPath = techniquesPath;
+    this.eclibDirectory = eclibDirectory;
+    this.pathResolver = new ECLabPathResolver(configurationRoot);
     
     // Register communication with base Device class CommunicationController
     // This enables automatic connection management and OPC UA node integration
@@ -43,11 +62,28 @@ public class ECLabDevice : Device
   /// </summary>
   public override void Open()
   {
-    // Communication is managed by CommunicationController
-    // Just initialize the device after communication is open
+    if (!this.communication.IsOpen)
+    {
+      Log.Information("Opening ECLab communication before initialization");
+      if (!this.communication.Open())
+      {
+        string message = this.communication.LastOpenErrorMessage ?? "Failed to open ECLab communication";
+        throw new InvalidOperationException(message);
+      }
+    }
+
     if (this.communication.IsOpen)
     {
-      bool success = this.Initialize();
+      if (this.isInitialized && this.channelInfos.Count > 0)
+      {
+        Log.Information(
+          "ECLab device {DeviceId} is already initialized with {ChannelCount} channel(s); skipping duplicate firmware load",
+          this.communication.DeviceId,
+          this.channelInfos.Count);
+        return;
+      }
+
+      bool success = this.Initialize(forceFirmwareReload: ForceFirmwareReloadOnOpen);
       if (!success)
       {
         throw new InvalidOperationException("Failed to initialize ECLab device - firmware loading failed");
@@ -60,15 +96,16 @@ public class ECLabDevice : Device
   /// </summary>
   public override void Close()
   {
-    // Communication closing is managed by CommunicationController
-    // Clean up any device-specific resources here if needed
     Log.Information("Closing ECLabDevice");
+    this.isInitialized = false;
+    this.channelInfos.Clear();
+    this.communication.Close();
   }
 
   /// <summary>
   /// Initialize device - discover channels and get version
   /// </summary>
-  public bool Initialize()
+  public bool Initialize(bool forceFirmwareReload = true)
   {
     try
     {
@@ -78,7 +115,19 @@ public class ECLabDevice : Device
         return false;
       }
 
+      if (this.isInitialized && this.channelInfos.Count > 0)
+      {
+        Log.Information(
+          "ECLab device {DeviceId} already initialized; skipping repeated initialization",
+          this.communication.DeviceId);
+        return true;
+      }
+
       Log.Information("Initializing ECLab device {DeviceId}", this.communication.DeviceId);
+      Log.Information("  Configuration root: {Root}", this.pathResolver.ConfigurationRoot);
+      Log.Information("  Techniques directory: {Path}", this.TechniquesPath);
+      Log.Information("  Native library directory: {Path}", this.ECLibDirectory);
+      Log.Information("  Firmware load mode: ForceReload={ForceFirmwareReload}", forceFirmwareReload);
 
       // Get library version
       try
@@ -115,8 +164,8 @@ public class ECLabDevice : Device
 
       // Load firmware to all plugged channels AFTER determining board type
       // Note: BL_GetChannelInfos requires firmware to be loaded (returns -308 FIRM_FIRMWARENOTLOADED otherwise)
-      Log.Information("Loading firmware to all plugged channels...");
-      bool firmwareLoaded = this.LoadFirmwareAllChannels(force: false, showGauge: false);
+      Log.Information("Loading firmware to all plugged channels with force={ForceFirmwareReload}...", forceFirmwareReload);
+      bool firmwareLoaded = this.LoadFirmwareAllChannels(force: forceFirmwareReload, showGauge: false);
       
       if (!firmwareLoaded)
       {
@@ -127,11 +176,14 @@ public class ECLabDevice : Device
       // Now discover channels (firmware should be loaded)
       this.DiscoverChannels();
 
+      this.isInitialized = this.channelInfos.Count > 0;
+
       Log.Information("Device initialized successfully");
-      return true;
+      return this.isInitialized;
     }
     catch (Exception ex)
     {
+      this.isInitialized = false;
       Log.Error(ex, "Error initializing ECLab device");
       return false;
     }
@@ -236,7 +288,8 @@ public class ECLabDevice : Device
 
     try
     {
-      string firmwarePath = this.GetFirmwarePath(this.boardType, out string fpgaPath);
+      BOARD_TYPE channelBoardType = this.GetBoardTypeForChannel(channel);
+      string firmwarePath = this.GetFirmwarePath(channelBoardType, out string fpgaPath);
 
       // Verify firmware files exist before loading
       if (!File.Exists(firmwarePath))
@@ -250,6 +303,12 @@ public class ECLabDevice : Device
         Log.Error("FPGA file not found: {FpgaPath}", fpgaPath);
         return false;
       }
+
+      string nativeFirmwarePath = this.pathResolver.ToNativePath(firmwarePath);
+      string nativeFpgaPath = string.IsNullOrEmpty(fpgaPath)
+        ? string.Empty
+        : this.pathResolver.ToNativePath(fpgaPath);
+      var loadVariants = this.BuildFirmwareLoadPathVariants(firmwarePath, fpgaPath, nativeFirmwarePath, nativeFpgaPath);
 
       // Diagnostic: Log file attributes to verify accessibility
       try
@@ -271,59 +330,151 @@ public class ECLabDevice : Device
       }
 
       Log.Information(
-          "Loading firmware for channel {Channel} (1-based: {OneBased}): Kernel={Firmware}, FPGA={Fpga}, BoardType={BoardType}, Force={Force}, ShowGauge={ShowGauge}",
+          "Loading firmware for channel {Channel} (1-based: {OneBased}): Kernel={Firmware}, FPGA={Fpga}, NativeKernel={NativeFirmware}, NativeFpga={NativeFpga}, BoardType={BoardType}, Force={Force}, ShowGauge={ShowGauge}",
           channel,
           channel + 1,
           firmwarePath,
           fpgaPath,
-          this.boardType,
+          nativeFirmwarePath,
+          nativeFpgaPath,
+          channelBoardType,
           force,
           showGauge);
 
-      try
-      {
-        var results = ECLibApi.LoadFirmware(
-            this.communication.DeviceId,
-            new[] { channel + 1 }, // Convert to 1-based
-            showGauge,
-            force,
-            firmwarePath,
-            fpgaPath);
+      int? lastResultCode = null;
+      ECLibException? lastEclibException = null;
 
-        // Check if this channel had an error
-        if (results.TryGetValue(channel + 1, out int result) && result != 0)
-        {
-          string errorMsg = ECLibApi.GetErrorMessage(result);
-          Log.Error("Firmware loading failed for channel {Channel}: {Error} (code: {Code})", 
-                    channel + 1, errorMsg, result);
-          
-          // Special handling for XIL file not found error (-304)
-          if (result == (int)BL_ERROR.FIRM_XILFILENOTEXISTS)
-          {
-            Log.Error("XIL (FPGA) file access failed. This may indicate:");
-            Log.Error("  1. File permission issues with: {FpgaPath}", fpgaPath);
-            Log.Error("  2. ECLib internal file access restrictions");
-            Log.Error("  3. File is locked by another process");
-            Log.Error("Suggestion: Try running the application as Administrator");
-          }
-          
-          return false;
-        }
-      }
-      catch (ECLibException ex)
+      foreach (var variant in loadVariants)
       {
-        Log.Error("Firmware loading failed: {Error}", ex.Message);
-        
-        // Special handling for communication errors that may indicate device state issues
-        if (ex.ErrorCode == (int)BL_ERROR.COMM_ALLOCMEMFAILED || 
-            ex.ErrorCode == (int)BL_ERROR.COMM_COMMFAILED)
+        Log.Information(
+          "Trying firmware load path variant {VariantName}: WorkingDirectory={WorkingDirectory}, KernelArg={KernelArg}, FpgaArg={FpgaArg}",
+          variant.Name,
+          variant.WorkingDirectory,
+          variant.FirmwareArgument,
+          string.IsNullOrEmpty(variant.FpgaArgument) ? "(none)" : variant.FpgaArgument);
+
+        for (int attempt = 1; attempt <= FirmwareLoadRetryCount; attempt++)
         {
-          Log.Error("Communication/memory error detected. Device may be in unstable state.");
-          Log.Error("Suggestion: Disconnect and reconnect the device before retrying");
+          try
+          {
+            Dictionary<int, int> results;
+            using (PushWorkingDirectory(variant.WorkingDirectory))
+            {
+              results = ECLibApi.LoadFirmware(
+                this.communication.DeviceId,
+                new[] { channel + 1 },
+                showGauge,
+                force,
+                variant.FirmwareArgument,
+                variant.FpgaArgument);
+            }
+
+            if (!results.TryGetValue(channel + 1, out int result) || result == 0)
+            {
+              goto FirmwareLoaded;
+            }
+
+            lastResultCode = result;
+            string errorMsg = ECLibApi.GetErrorMessage(result);
+            bool isRetriable = this.IsRetriableFirmwareError(result);
+
+            if (isRetriable && attempt < FirmwareLoadRetryCount)
+            {
+              Log.Warning(
+                "Firmware loading attempt {Attempt}/{MaxAttempts} failed for channel {Channel} using variant {VariantName}: {Error} (code: {Code}). Retrying after {DelayMs} ms.",
+                attempt,
+                FirmwareLoadRetryCount,
+                channel + 1,
+                variant.Name,
+                errorMsg,
+                result,
+                FirmwareLoadRetryDelayMs);
+              Thread.Sleep(FirmwareLoadRetryDelayMs);
+              continue;
+            }
+
+            Log.Warning(
+              "Firmware loading variant {VariantName} failed for channel {Channel}: {Error} (code: {Code})",
+              variant.Name,
+              channel + 1,
+              errorMsg,
+              result);
+
+            if (result == (int)BL_ERROR.FIRM_XILFILENOTEXISTS)
+            {
+              Log.Warning("XIL (FPGA) file resolution failed for variant {VariantName}", variant.Name);
+            }
+
+            if (IsFirmwarePathResolutionError(result))
+            {
+              break;
+            }
+
+            return false;
+          }
+          catch (ECLibException ex)
+          {
+            lastEclibException = ex;
+            bool isRetriable = this.IsRetriableFirmwareError(ex.ErrorCode);
+            if (isRetriable && attempt < FirmwareLoadRetryCount)
+            {
+              Log.Warning(
+                "Firmware loading attempt {Attempt}/{MaxAttempts} raised retriable error for channel {Channel} using variant {VariantName}: {Error} (code: {Code}). Retrying after {DelayMs} ms.",
+                attempt,
+                FirmwareLoadRetryCount,
+                channel + 1,
+                variant.Name,
+                ex.Message,
+                ex.ErrorCode,
+                FirmwareLoadRetryDelayMs);
+              Thread.Sleep(FirmwareLoadRetryDelayMs);
+              continue;
+            }
+
+            Log.Warning(
+              "Firmware loading variant {VariantName} raised error for channel {Channel}: {Error}",
+              variant.Name,
+              channel + 1,
+              ex.Message);
+
+            if (IsFirmwarePathResolutionError(ex.ErrorCode))
+            {
+              break;
+            }
+
+            if (ex.ErrorCode == (int)BL_ERROR.COMM_ALLOCMEMFAILED ||
+                ex.ErrorCode == (int)BL_ERROR.COMM_COMMFAILED)
+            {
+              Log.Error("Communication/memory error detected. Device may be in unstable state.");
+              Log.Error("Suggestion: Disconnect and reconnect the device before retrying");
+            }
+
+            return false;
+          }
         }
-        
-        return false;
       }
+
+      if (lastEclibException != null)
+      {
+        Log.Error("Firmware loading failed after exhausting all path variants: {Error}", lastEclibException.Message);
+      }
+      else if (lastResultCode.HasValue)
+      {
+        Log.Error(
+          "Firmware loading failed after exhausting all path variants: {Error} (code: {Code})",
+          ECLibApi.GetErrorMessage(lastResultCode.Value),
+          lastResultCode.Value);
+      }
+
+      if (lastResultCode == (int)BL_ERROR.FIRM_XILFILENOTEXISTS ||
+          lastEclibException?.ErrorCode == (int)BL_ERROR.FIRM_XILFILENOTEXISTS)
+      {
+        Log.Error("XIL (FPGA) file access failed across all path variants. This strongly suggests an ECLib path-resolution issue rather than a transient connection failure.");
+      }
+
+      return false;
+
+FirmwareLoaded:
 
       // Refresh channel info after firmware loading
       try
@@ -375,7 +526,7 @@ public class ECLabDevice : Device
         return false;
       }
 
-      Log.Information("Loading firmware for {Count} channel(s)", pluggedChannels.Length);
+      Log.Information("Loading firmware for {Count} channel(s) with force={Force}, showGauge={ShowGauge}", pluggedChannels.Length, force, showGauge);
 
       // Load firmware for each channel
       bool allSuccess = true;
@@ -418,11 +569,9 @@ public class ECLabDevice : Device
   /// <returns>Relative path to kernel firmware file</returns>
   private string GetFirmwarePath(BOARD_TYPE boardType, out string fpgaPath)
   {
-    // Use configured techniques path (relative to working directory)
-    // Default to "lib" if not configured
-    string firmwareDir = this.techniquesPath ?? "lib";
+    string firmwareDir = this.TechniquesPath;
 
-    Log.Debug("Using firmware directory: {FirmwareDir} (relative to working directory)", firmwareDir);
+    Log.Debug("Using firmware directory: {FirmwareDir}", firmwareDir);
 
     switch (boardType)
     {
@@ -474,18 +623,127 @@ public class ECLabDevice : Device
     return this.communication.TestConnection();
   }
 
+  public string ResolveTechniqueFilePath(string techniqueFile, byte? channel = null)
+  {
+    if (string.IsNullOrWhiteSpace(techniqueFile))
+    {
+      throw new ArgumentException("Technique file name must be provided", nameof(techniqueFile));
+    }
+
+    string resolvedFileName = this.ResolveTechniqueFileName(techniqueFile, channel);
+    return Path.Combine(this.TechniquesPath, resolvedFileName);
+  }
+
+  public string GetNativeTechniqueFilePath(string techniqueFile, byte? channel = null)
+  {
+    return this.pathResolver.ToNativePath(this.ResolveTechniqueFilePath(techniqueFile, channel));
+  }
+
   /// <summary>
   /// Get techniques directory path (relative to working directory)
   /// </summary>
   private string GetTechniquesDirectory()
   {
-    return this.techniquesPath ?? "lib";
+    return this.pathResolver.ResolveDirectory(this.techniquesPath, "lib");
+  }
+
+  private string GetECLibDirectory()
+  {
+    return this.pathResolver.ResolveDirectory(this.eclibDirectory ?? this.techniquesPath, "lib");
+  }
+
+  private bool IsRetriableFirmwareError(int errorCode)
+  {
+    return errorCode == (int)BL_ERROR.FIRM_XILFILENOTEXISTS ||
+           errorCode == (int)BL_ERROR.COMM_COMMFAILED ||
+           errorCode == (int)BL_ERROR.COMM_ALLOCMEMFAILED;
+  }
+
+  private static bool IsFirmwarePathResolutionError(int errorCode)
+  {
+    return errorCode == (int)BL_ERROR.FIRM_FIRMFILENOTEXISTS ||
+           errorCode == (int)BL_ERROR.FIRM_FIRMFILEACCESSFAILED ||
+           errorCode == (int)BL_ERROR.FIRM_XILFILENOTEXISTS ||
+           errorCode == (int)BL_ERROR.FIRM_XILFILEACCESSFAILED;
+  }
+
+  private IReadOnlyList<FirmwareLoadPathVariant> BuildFirmwareLoadPathVariants(
+    string firmwarePath,
+    string fpgaPath,
+    string nativeFirmwarePath,
+    string nativeFpgaPath)
+  {
+    var variants = new List<FirmwareLoadPathVariant>();
+    string techniquesDirectory = this.TechniquesPath;
+    string configurationRoot = this.pathResolver.ConfigurationRoot;
+    string firmwareFileName = Path.GetFileName(firmwarePath);
+    string fpgaFileName = string.IsNullOrEmpty(fpgaPath) ? string.Empty : Path.GetFileName(fpgaPath);
+
+    variants.Add(new FirmwareLoadPathVariant(
+      "oem-filename-from-lib",
+      techniquesDirectory,
+      firmwareFileName,
+      fpgaFileName));
+
+    variants.Add(new FirmwareLoadPathVariant(
+      "relative-from-config-root",
+      configurationRoot,
+      Path.GetRelativePath(configurationRoot, firmwarePath),
+      string.IsNullOrEmpty(fpgaPath) ? string.Empty : Path.GetRelativePath(configurationRoot, fpgaPath)));
+
+    variants.Add(new FirmwareLoadPathVariant(
+      "absolute-native-path",
+      configurationRoot,
+      nativeFirmwarePath,
+      nativeFpgaPath));
+
+    return variants;
+  }
+
+  private static IDisposable PushWorkingDirectory(string workingDirectory)
+  {
+    return new WorkingDirectoryScope(workingDirectory);
+  }
+
+  private BOARD_TYPE GetBoardTypeForChannel(byte channel)
+  {
+    try
+    {
+      return this.DetermineBoardType(channel);
+    }
+    catch
+    {
+      return this.boardType;
+    }
+  }
+
+  private string ResolveTechniqueFileName(string techniqueFile, byte? channel)
+  {
+    string extension = Path.GetExtension(techniqueFile);
+    string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(techniqueFile);
+
+    if (channel is null ||
+        fileNameWithoutExtension.EndsWith("4", StringComparison.OrdinalIgnoreCase) ||
+        fileNameWithoutExtension.EndsWith("5", StringComparison.OrdinalIgnoreCase))
+    {
+      return techniqueFile;
+    }
+
+    string candidateFileName = this.GetBoardTypeForChannel(channel.Value) switch
+    {
+      BOARD_TYPE.PREMIUM => $"{fileNameWithoutExtension}4{extension}",
+      BOARD_TYPE.DIGICORE => $"{fileNameWithoutExtension}5{extension}",
+      _ => techniqueFile
+    };
+
+    string candidatePath = Path.Combine(this.TechniquesPath, candidateFileName);
+    return File.Exists(candidatePath) ? candidateFileName : techniqueFile;
   }
 
   /// <summary>
   /// Get property by name for SequenceItem compatibility
   /// </summary>
-  public object? GetProperty(string propertyName)
+  public new object? GetProperty(string propertyName)
   {
     return propertyName switch
     {
@@ -494,8 +752,33 @@ public class ECLabDevice : Device
       "IsError" => this.communication.IsError,
       "DeviceInfo" => this.communication.DeviceInfo,
       "ChannelCount" => this.channelInfos.Count,
+      "IsInitialized" => this.IsInitialized,
       "TechniquesPath" => this.TechniquesPath,
+      "ECLibDirectory" => this.ECLibDirectory,
+      "BoardType" => this.boardType,
       _ => null
     };
+  }
+
+  private sealed record FirmwareLoadPathVariant(
+    string Name,
+    string WorkingDirectory,
+    string FirmwareArgument,
+    string FpgaArgument);
+
+  private sealed class WorkingDirectoryScope : IDisposable
+  {
+    private readonly string previousDirectory;
+
+    public WorkingDirectoryScope(string workingDirectory)
+    {
+      this.previousDirectory = Directory.GetCurrentDirectory();
+      Directory.SetCurrentDirectory(workingDirectory);
+    }
+
+    public void Dispose()
+    {
+      Directory.SetCurrentDirectory(this.previousDirectory);
+    }
   }
 }

@@ -1,4 +1,5 @@
 using Biologic.Native;
+using Biologic.Devices;
 using System.Text.Json;
 using DeviceControlSoftware;
 using Serilog;
@@ -15,6 +16,7 @@ public class LoadTechniqueSequenceItem : SequenceItem
   private byte _channelIndex;
   private string _techniqueFile = string.Empty;
   private Dictionary<string, object>? _parameters;
+  private ECLabDevice? _device;
 
   public override void Initialize(Sequence.StateContext context)
   {
@@ -32,8 +34,9 @@ public class LoadTechniqueSequenceItem : SequenceItem
 
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
-    if (device != null && device.GetProperty("DeviceId") is int deviceId)
+    if (device is ECLabDevice ecLabDevice && device.GetProperty("DeviceId") is int deviceId)
     {
+      _device = ecLabDevice;
       _deviceId = deviceId;
     }
     else
@@ -46,18 +49,29 @@ public class LoadTechniqueSequenceItem : SequenceItem
   {
     try
     {
-      // Build full path to .ecc file
-      var eccPath = Path.Combine(
-          AppDomain.CurrentDomain.BaseDirectory,
-          "Techniques",
-          _techniqueFile);
+      if (_device == null)
+      {
+        throw new InvalidOperationException("ECLab device not available for technique loading");
+      }
+
+      if (!_device.IsConnected || _device.DeviceId < 0)
+      {
+        throw new InvalidOperationException("Device is not connected");
+      }
+
+      string eccPath = _device.ResolveTechniqueFilePath(_techniqueFile, _channelIndex);
+      string nativeEccPath = _device.GetNativeTechniqueFilePath(_techniqueFile, _channelIndex);
 
       if (!File.Exists(eccPath))
       {
         throw new FileNotFoundException($"Technique file not found: {eccPath}");
       }
 
-      Log.Information("Loading technique from {TechniqueFile} to channel {Channel}", eccPath, _channelIndex);
+      Log.Information(
+        "Loading technique from {TechniqueFile} to channel {Channel} (native path: {NativeTechniqueFile})",
+        eccPath,
+        _channelIndex,
+        nativeEccPath);
 
       // Create EccParams structure
       var eccParams = new EccParams
@@ -90,7 +104,7 @@ public class LoadTechniqueSequenceItem : SequenceItem
         ECLibApi.LoadTechnique(
             _deviceId,
             _channelIndex + 1, // Convert to 1-based
-            eccPath,
+          nativeEccPath,
             ref eccParams,
             first: true,
             last: true,

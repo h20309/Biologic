@@ -148,6 +148,11 @@ public class ECLibApi
     }
   }
 
+  public static string? GetLoadedLibraryPath()
+  {
+    return ECLibNative.GetLoadedModulePath("EClib64.dll");
+  }
+
   /// <summary>
   /// Get channel information
   /// </summary>
@@ -208,6 +213,61 @@ public class ECLibApi
       3 => BOARD_TYPE.DIGICORE,
       _ => BOARD_TYPE.UNKNOWN
     };
+  }
+
+  /// <summary>
+  /// Drain pending channel messages without throwing on diagnostic failures.
+  /// </summary>
+  public static IReadOnlyList<string> DrainChannelMessages(int deviceId, int channel, int maxMessages = 16)
+  {
+    var messages = new List<string>();
+
+    if (channel < 1 || channel > 16)
+    {
+      return messages;
+    }
+
+    byte channelByte = (byte)(channel - 1);
+    for (int i = 0; i < maxMessages; i++)
+    {
+      uint size = 1024;
+      var buffer = new StringBuilder((int)size);
+      int errorCode = ECLibNative.BL_GetMessage(deviceId, channelByte, buffer, ref size);
+      if (errorCode != 0)
+      {
+        break;
+      }
+
+      string message = buffer.ToString().TrimEnd('\0', ' ', '\r', '\n', '\t');
+      if (size == 0 || string.IsNullOrWhiteSpace(message))
+      {
+        break;
+      }
+
+      messages.Add(message);
+    }
+
+    return messages;
+  }
+
+  /// <summary>
+  /// Try to retrieve option error information for diagnostics.
+  /// </summary>
+  public static (int OptError, int OptPos)? TryGetOptionError(int deviceId, int channel)
+  {
+    if (channel < 1 || channel > 16)
+    {
+      return null;
+    }
+
+    byte channelByte = (byte)(channel - 1);
+    int errorCode = ECLibNative.BL_GetOptErr(deviceId, channelByte, out int optError, out int optPos);
+    if (errorCode != 0)
+    {
+      return null;
+    }
+
+    return (optError, optPos);
   }
 
   /// <summary>
@@ -289,15 +349,15 @@ public class ECLibApi
     int[] channels,
     bool showGauge = true,
     bool force = false,
-    string firmwarePath = null,
-    string fpgaPath = null)
+    string? firmwarePath = null,
+    string? fpgaPath = null)
   {
-    bool[] channelMap = new bool[16];
+    byte[] channelMap = new byte[16];
     foreach (int ch in channels)
     {
       if (ch >= 1 && ch <= 16)
       {
-        channelMap[ch - 1] = true; // Convert to 0-based
+        channelMap[ch - 1] = 1; // Convert to 0-based and match c_bool[16]
       }
     }
 
@@ -335,6 +395,36 @@ public class ECLibApi
   #endregion
 
   #region Technique Management
+
+  /// <summary>
+  /// Define a boolean technique parameter using the vendor API.
+  /// </summary>
+  public static EccParam DefineBoolParameter(string label, bool value, int index = 0)
+  {
+    int errorCode = ECLibNative.BL_DefineBoolParameter(label, value, index, out EccParam parameter);
+    CheckError(errorCode, $"DefineBoolParameter '{label}'");
+    return parameter;
+  }
+
+  /// <summary>
+  /// Define an integer technique parameter using the vendor API.
+  /// </summary>
+  public static EccParam DefineIntParameter(string label, int value, int index = 0)
+  {
+    int errorCode = ECLibNative.BL_DefineIntParameter(label, value, index, out EccParam parameter);
+    CheckError(errorCode, $"DefineIntParameter '{label}'");
+    return parameter;
+  }
+
+  /// <summary>
+  /// Define a single-precision technique parameter using the vendor API.
+  /// </summary>
+  public static EccParam DefineSingleParameter(string label, float value, int index = 0)
+  {
+    int errorCode = ECLibNative.BL_DefineSglParameter(label, value, index, out EccParam parameter);
+    CheckError(errorCode, $"DefineSingleParameter '{label}'");
+    return parameter;
+  }
 
   /// <summary>
   /// Load technique from .ecc file
@@ -379,12 +469,12 @@ public class ECLibApi
   /// </summary>
   public static Dictionary<int, int> StartChannels(int deviceId, int[] channels)
   {
-    bool[] channelMap = new bool[16];
+    byte[] channelMap = new byte[16];
     foreach (int ch in channels)
     {
       if (ch >= 1 && ch <= 16)
       {
-        channelMap[ch - 1] = true;
+        channelMap[ch - 1] = 1;
       }
     }
 
@@ -418,12 +508,12 @@ public class ECLibApi
   /// </summary>
   public static Dictionary<int, int> StopChannels(int deviceId, int[] channels)
   {
-    bool[] channelMap = new bool[16];
+    byte[] channelMap = new byte[16];
     foreach (int ch in channels)
     {
       if (ch >= 1 && ch <= 16)
       {
-        channelMap[ch - 1] = true;
+        channelMap[ch - 1] = 1;
       }
     }
 

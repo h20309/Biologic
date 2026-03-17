@@ -10,16 +10,22 @@ namespace Biologic.Communications;
 /// </summary>
 public class ECLabCommunication : Communication
 {
+  private readonly object syncRoot = new();
   private readonly string address;
   private readonly byte timeoutSeconds;
   private int deviceId = -1;
   private DeviceInfo deviceInfo;
   private bool isOpen;
   private bool isError;
+  private int? lastOpenErrorCode;
+  private string? lastOpenErrorMessage;
 
   public int DeviceId => this.deviceId;
   public DeviceInfo DeviceInfo => this.deviceInfo;
   public bool IsOpen => this.isOpen;
+  public int? LastOpenErrorCode => this.lastOpenErrorCode;
+  public string? LastOpenErrorMessage => this.lastOpenErrorMessage;
+  public bool IsBusyConnection => this.lastOpenErrorCode.HasValue && IsExclusiveConnectionError(this.lastOpenErrorCode.Value);
 
   public override bool IsError => this.isError;
 
@@ -36,6 +42,8 @@ public class ECLabCommunication : Communication
 
   public override bool Open()
   {
+    lock (this.syncRoot)
+    {
     try
     {
       if (this.isOpen)
@@ -48,19 +56,31 @@ public class ECLabCommunication : Communication
 
       try
       {
+        this.ResetOpenErrorState();
+        this.isError = false;
         (this.deviceId, this.deviceInfo) = ECLibApi.Connect(this.address, this.timeoutSeconds);
       }
       catch (ECLibException ex)
       {
+        this.lastOpenErrorCode = ex.ErrorCode;
+        this.lastOpenErrorMessage = BuildOpenErrorMessage(ex);
         Log.Error(
             "Failed to connect to ECLab device at {Address}. Error code: {ErrorCode}, Message: {ErrorMessage}",
             this.address, ex.ErrorCode, ex.Message);
         this.isError = true;
+        this.isOpen = false;
+
+        if (this.Node != null)
+        {
+          this.Status = this.IsBusyConnection ? "Busy" : "ConnectionError";
+        }
+
         return false;
       }
 
       this.isOpen = true;
       this.isError = false;
+      this.ResetOpenErrorState();
 
       if (this.Node != null)
       {
@@ -72,6 +92,12 @@ public class ECLabCommunication : Communication
           this.deviceId,
           (DEVICE)this.deviceInfo.DeviceCode,
           this.deviceInfo.NumberOfChannels);
+
+      string? loadedLibraryPath = ECLibApi.GetLoadedLibraryPath();
+      if (!string.IsNullOrWhiteSpace(loadedLibraryPath))
+      {
+        Log.Information("Loaded EClib64.dll from: {LibraryPath}", loadedLibraryPath);
+      }
       
       Log.Information(
           "Note: Firmware and FPGA loading happens in ECLabDevice.LoadFirmware(), not during connection");
@@ -82,6 +108,7 @@ public class ECLabCommunication : Communication
     {
       Log.Error(dllEx, "ECLib64.dll not found. Please ensure EC-Lab Development Package is installed or ECLib64.dll is in PATH");
       Log.Error("Current directory: {WorkingDir}", Directory.GetCurrentDirectory());
+      this.lastOpenErrorMessage = $"EClib64.dll not found: {dllEx.Message}";
       this.isError = true;
       this.isOpen = false;
       return false;
@@ -89,14 +116,18 @@ public class ECLabCommunication : Communication
     catch (Exception ex)
     {
       Log.Error(ex, "Exception occurred while opening ECLab communication");
+      this.lastOpenErrorMessage = ex.Message;
       this.isError = true;
       this.isOpen = false;
       return false;
+    }
     }
   }
 
   public override void Close()
   {
+    lock (this.syncRoot)
+    {
     try
     {
       if (this.deviceId >= 0)
@@ -108,6 +139,7 @@ public class ECLabCommunication : Communication
 
       this.isOpen = false;
       this.isError = false;
+      this.ResetOpenErrorState();
 
       if (this.Node != null)
       {
@@ -118,6 +150,7 @@ public class ECLabCommunication : Communication
     {
       Log.Error(ex, "Error disconnecting from ECLab device");
       this.isError = true;
+    }
     }
   }
 
@@ -147,5 +180,28 @@ public class ECLabCommunication : Communication
       this.isError = true;
       return false;
     }
+  }
+
+  private void ResetOpenErrorState()
+  {
+    this.lastOpenErrorCode = null;
+    this.lastOpenErrorMessage = null;
+  }
+
+  private static bool IsExclusiveConnectionError(int errorCode)
+  {
+    return errorCode == (int)BL_ERROR.GEN_ECLAB_LOADED ||
+           errorCode == (int)BL_ERROR.COMM_CONNECTIONFAILED ||
+           errorCode == (int)BL_ERROR.COMM_MAXCONNREACHED;
+  }
+
+  private static string BuildOpenErrorMessage(ECLibException ex)
+  {
+    if (IsExclusiveConnectionError(ex.ErrorCode))
+    {
+      return "The instrument is already in use by another client. Close EC-Lab or any other process holding the COM/USB connection, then retry ORBIT.";
+    }
+
+    return ex.Message;
   }
 }
