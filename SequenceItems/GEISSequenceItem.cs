@@ -16,16 +16,9 @@ public class GEISSequenceItem : SequenceItem
   private const float DefaultRecordEveryDe = 0.0f;
   private const float DefaultWaitForSteady = 0.0f;
   private const float DefaultDurationStep = 1.0f;
-  private const float DefaultNonZeroCurrentStep = 1e-6f;
-  private const float DefaultConservativeAmplitude = 10e-6f;
-  private const float DefaultConservativeInitialFrequency = 10000.0f;
-  private const float DefaultConservativeFinalFrequency = 1.0f;
-  private const int DefaultConservativeFrequencyPoints = 10;
-  private const float DefaultConservativeWaitForSteady = 1.0f;
   private const int DefaultAverageCount = 1;
   private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
   private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
-  private static readonly TimeSpan StopWaitTimeout = TimeSpan.FromSeconds(5);
 
   private int _deviceId;
   private byte _channelIndex;
@@ -113,7 +106,7 @@ public class GEISSequenceItem : SequenceItem
         throw new InvalidOperationException("Device is not connected");
       }
 
-      this.EnsureChannelStoppedBeforeLoading();
+      this.EnsureChannelReadyForNewSequence();
 
       this.LoadGeisTechniqueWithFallbacks("geis.ecc");
 
@@ -536,7 +529,6 @@ public class GEISSequenceItem : SequenceItem
     }
 
     string nativeEccPath = _device.GetNativeTechniqueFilePath(preferredTechniqueFile, _channelIndex);
-    this.ResetChannelBeforeGeisAttempt();
 
     var eccParams = new EccParams
     {
@@ -611,43 +603,16 @@ public class GEISSequenceItem : SequenceItem
     return parameters;
   }
 
-  private void EnsureChannelStoppedBeforeLoading()
-  {
-    var currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
-    if ((PROG_STATE)currentValues.State == PROG_STATE.STOP)
-    {
-      return;
-    }
-
-    Log.Information("Stopping channel {Channel} before loading GEIS because current state is {State}", _channelIndex, (PROG_STATE)currentValues.State);
-    ECLibApi.StopChannel(_deviceId, _channelIndex + 1);
-
-    DateTime deadline = DateTime.UtcNow + StopWaitTimeout;
-    while (DateTime.UtcNow < deadline)
-    {
-      currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
-      if ((PROG_STATE)currentValues.State == PROG_STATE.STOP)
-      {
-        return;
-      }
-
-      Thread.Sleep(TimeSpan.FromMilliseconds(100));
-    }
-
-    throw new TimeoutException($"Channel {_channelIndex} did not reach STOP before GEIS loading.");
-  }
-
-  private void ResetChannelBeforeGeisAttempt()
+  private void EnsureChannelReadyForNewSequence()
   {
     if (_device == null)
     {
-      throw new InvalidOperationException("GEIS device context is not available for channel reset.");
+      throw new InvalidOperationException("GEIS device context is not available.");
     }
 
-    bool resetSucceeded = _device.ResetChannelTechniqueState(_channelIndex, forceFirmwareReload: true);
-    if (!resetSucceeded)
+    if (!_device.CanStartSequenceOnChannel(_channelIndex, out string message))
     {
-      throw new InvalidOperationException($"Failed to reset channel {_channelIndex} before GEIS attempt.");
+      throw new InvalidOperationException(message);
     }
   }
 

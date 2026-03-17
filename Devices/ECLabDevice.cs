@@ -27,9 +27,30 @@ public class ECLabDevice : Device
 
   public override string Name => DeviceName;
 
-  public override bool IsBusy => this.communication.IsBusyConnection;
+  public override bool IsBusy => this.communication.IsBusyConnection || this.IsTechniqueRunning;
 
   public new bool IsConnected => this.communication.IsOpen;
+
+  public bool IsTechniqueRunning
+  {
+    get
+    {
+      if (!this.communication.IsOpen || this.communication.DeviceId < 0)
+      {
+        return false;
+      }
+
+      foreach (byte channel in this.channelInfos.Keys)
+      {
+        if (this.IsChannelRunning(channel))
+        {
+          return true;
+        }
+      }
+
+      return false;
+    }
+  }
 
   public bool IsInitialized => this.isInitialized;
 
@@ -40,6 +61,56 @@ public class ECLabDevice : Device
   public string TechniquesPath => this.GetTechniquesDirectory();
 
   public string ECLibDirectory => this.GetECLibDirectory();
+
+  public bool IsChannelRunning(byte channel)
+  {
+    if (!this.communication.IsOpen || this.communication.DeviceId < 0)
+    {
+      return false;
+    }
+
+    try
+    {
+      CurrentValues currentValues = ECLibApi.GetCurrentValues(this.communication.DeviceId, channel + 1);
+      return (PROG_STATE)currentValues.State != PROG_STATE.STOP;
+    }
+    catch (ECLibException)
+    {
+      return false;
+    }
+  }
+
+  public bool CanStartSequenceOnChannel(byte channel, out string message)
+  {
+    message = string.Empty;
+
+    if (!this.communication.IsOpen || this.communication.DeviceId < 0)
+    {
+      message = $"Device is not connected for channel {channel}.";
+      return false;
+    }
+
+    try
+    {
+      CurrentValues currentValues = ECLibApi.GetCurrentValues(this.communication.DeviceId, channel + 1);
+      ChannelInfo channelInfo = ECLibApi.GetChannelInfo(this.communication.DeviceId, channel + 1);
+      PROG_STATE currentState = (PROG_STATE)currentValues.State;
+      PROG_STATE infoState = (PROG_STATE)channelInfo.State;
+
+      if (currentState != PROG_STATE.STOP || infoState != PROG_STATE.STOP)
+      {
+        message = $"Channel {channel} is busy. Stop the current sequence before starting a new one.";
+        return false;
+      }
+
+      return true;
+    }
+    catch (ECLibException ex)
+    {
+      message = $"Failed to read channel {channel} state before starting a new sequence: {ex.Message}";
+      return false;
+    }
+  }
 
   public ECLabDevice(
     ECLabCommunication communication,

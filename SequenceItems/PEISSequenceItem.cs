@@ -19,6 +19,7 @@ public class PEISSequenceItem : SequenceItem
   private float _dcVoltage_V;
   private float _acAmplitude_V;
   private Dictionary<string, object>? _parameters;
+  private ECLabDevice? _device;
 
   public override void Initialize(Sequence.StateContext context)
   {
@@ -34,8 +35,9 @@ public class PEISSequenceItem : SequenceItem
 
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
-    if (device != null && device.GetProperty("DeviceId") is int deviceId)
+    if (device is ECLabDevice ecLabDevice && device.GetProperty("DeviceId") is int deviceId)
     {
+      _device = ecLabDevice;
       _deviceId = deviceId;
     }
     else
@@ -61,14 +63,22 @@ public class PEISSequenceItem : SequenceItem
   {
     try
     {
+      if (_device == null || !_device.IsConnected || _device.DeviceId < 0)
+      {
+        throw new InvalidOperationException("Device is not connected");
+      }
+
+      if (!_device.CanStartSequenceOnChannel(_channelIndex, out string busyMessage))
+      {
+        throw new InvalidOperationException(busyMessage);
+      }
+
       Log.Information("Starting PEIS on channel {Channel}: {InitFreq}Hz to {FinalFreq}Hz, {Points} points",
         _channelIndex, _initialFrequency_Hz, _finalFrequency_Hz, _frequencyPoints);
 
       // Load PEIS technique
-      string eccPath = Path.Combine(
-        AppDomain.CurrentDomain.BaseDirectory,
-        "EC-Lab Development Package\\lib",
-        "peis.ecc");
+      string eccPath = _device.ResolveTechniqueFilePath("peis.ecc", _channelIndex);
+      string nativeEccPath = _device.GetNativeTechniqueFilePath("peis.ecc", _channelIndex);
 
       if (!File.Exists(eccPath))
       {
@@ -104,7 +114,7 @@ public class PEISSequenceItem : SequenceItem
         ECLibApi.LoadTechnique(
           _deviceId,
           _channelIndex + 1,
-          eccPath,
+          nativeEccPath,
           ref eccParams,
           first: true,
           last: true,

@@ -62,6 +62,7 @@ public class ECLabSystem : SequenceDispatcher
     // Channel control
     this.AddSequenceCreator("StartChannel", (prop) => new StartChannelSequenceItem { Properties = prop });
     this.AddSequenceCreator("StopChannel", (prop) => new StopChannelSequenceItem { Properties = prop });
+    this.AddSequenceCreator("ForceStopBiologicChannel", (prop) => new ForceStopBiologicChannelSequenceItem { Properties = prop });
 
     // Technique loading
     this.AddSequenceCreator("LoadTechnique", (prop) => new LoadTechniqueSequenceItem { Properties = prop });

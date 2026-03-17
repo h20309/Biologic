@@ -62,6 +62,11 @@ public class DischargeSequenceItem : SequenceItem
         throw new InvalidOperationException("Device is not connected");
       }
 
+      if (!_device.CanStartSequenceOnChannel(_channelIndex, out string busyMessage))
+      {
+        throw new InvalidOperationException(busyMessage);
+      }
+
       Log.Information("Starting discharge on channel {Channel}: Current={Current}A, Duration={Duration}s, Cutoff={Cutoff}V",
         _channelIndex, _current_A, _duration_s, _cutoffVoltage_V);
 

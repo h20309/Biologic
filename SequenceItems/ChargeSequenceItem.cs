@@ -93,6 +93,11 @@ public class ChargeSequenceItem : SequenceItem
         throw new InvalidOperationException("Device is not connected");
       }
 
+      if (!this._device.CanStartSequenceOnChannel(this._channelIndex, out string busyMessage))
+      {
+        throw new InvalidOperationException(busyMessage);
+      }
+
       Log.Information("Starting CA technique on channel {Channel}: Voltage={Voltage}V, Duration={Duration}s",
         this._channelIndex, this._cutoffVoltage_V, this._duration_s);
 
