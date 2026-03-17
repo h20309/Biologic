@@ -73,3 +73,7 @@
 **/_ReSharper*/
 **/*.[Rr]e[Ss]harper*/
 /Docs
+
+# pycache
+**/__pycache__/
+**/*.pyc
