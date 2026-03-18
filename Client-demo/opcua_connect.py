@@ -51,6 +51,11 @@ BIOLOGIC_OUTPUT_NODES: Dict[str, str] = {
     "LatestEISHistoryJson": "ns=3;i=6103",
     "LatestEISPointCount": "ns=3;i=6104",
     "LatestEISRunId": "ns=3;i=6105",
+    "LatestChargeStatus": "ns=3;i=6106",
+    "LatestChargeUpdatedAt": "ns=3;i=6107",
+    "LatestChargeSeriesJson": "ns=3;i=6108",
+    "LatestChargePointCount": "ns=3;i=6109",
+    "LatestChargeCsvPath": "ns=3;i=6110",
 }
 
 BIOLOGIC_METHOD_NAMES = tuple(DEFAULT_METHOD_NODE_IDS.keys())

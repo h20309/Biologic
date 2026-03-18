@@ -260,7 +260,7 @@ async def call_biologic_method(server_url: str, method_name: str, payload: Dict[
                 "error": (
                     f"The OPC UA server currently exposes {method_name} with 0 input arguments. "
                     "This client sends one JSON string argument, so the live server model is out of sync with the Biologic runtime. "
-                    "Update the Biologic NodeSet/open62541 wrapper, rebuild, and restart ORBIT."
+                    "Update the Biologic NodeSet XML, rebuild so the generated OPC UA sources refresh, and restart ORBIT."
                 ),
             }
 
@@ -587,6 +587,67 @@ def render_eis_panels(snapshot: Optional[Dict[str, Any]]) -> None:
         render_spectrum_view(selected_result)
 
 
+def render_charge_trend_panel(snapshot: Optional[Dict[str, Any]]) -> None:
+    if not snapshot or not snapshot.get("connected"):
+        st.info("No Biologic output snapshot available.")
+        return
+
+    values = snapshot.get("values", {})
+    charge_status = str(values.get("LatestChargeStatus", "-"))
+    charge_points = safe_parse_json(values.get("LatestChargeSeriesJson"))
+    csv_path = values.get("LatestChargeCsvPath")
+
+    status_col1, status_col2, status_col3 = st.columns(3)
+    status_col1.metric("Charge Status", charge_status)
+    status_col2.metric("Charge Points", str(values.get("LatestChargePointCount", "-")))
+    status_col3.metric("Charge Updated", str(values.get("LatestChargeUpdatedAt", "-")))
+
+    if csv_path:
+        st.caption(f"CSV Path: {csv_path}")
+
+    if not isinstance(charge_points, list) or not charge_points:
+        st.info("No Charge time-series points have been published yet.")
+        return
+
+    charge_df = pd.DataFrame(charge_points)
+    st.dataframe(charge_df, width="stretch", hide_index=True)
+
+    if not {"Time_s", "Ewe_V", "I_A"}.issubset(charge_df.columns):
+        st.warning("Charge series payload is missing required columns.")
+        return
+
+    chart = go.Figure()
+    chart.add_trace(
+        go.Scatter(
+            x=charge_df["Time_s"],
+            y=charge_df["Ewe_V"],
+            mode="lines+markers",
+            name="Ewe (V)",
+            line=dict(color="#E4572E", width=2),
+        )
+    )
+    chart.add_trace(
+        go.Scatter(
+            x=charge_df["Time_s"],
+            y=charge_df["I_A"],
+            mode="lines+markers",
+            name="I (A)",
+            yaxis="y2",
+            line=dict(color="#2E86AB", width=2),
+        )
+    )
+    chart.update_layout(
+        title="Charge Time-Series",
+        xaxis=dict(title="Time (s)", gridcolor="#E8E8E8"),
+        yaxis=dict(title="Ewe (V)", gridcolor="#E8E8E8"),
+        yaxis2=dict(title="I (A)", overlaying="y", side="right"),
+        hovermode="x unified",
+        height=460,
+        margin=dict(l=60, r=60, t=60, b=50),
+    )
+    st.plotly_chart(chart, width="stretch")
+
+
 def build_payload_from_form(method_name: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     schema = METHOD_SCHEMAS[method_name]
@@ -836,9 +897,13 @@ def render_instrument_page(active_server_url: str) -> None:
         output_rows = [
             {"Key": key, "Value": value}
             for key, value in snapshot_values.items()
-            if key not in {"LatestEISResultJson", "LatestEISHistoryJson"}
+            if key not in {"LatestEISResultJson", "LatestEISHistoryJson", "LatestChargeSeriesJson"}
         ]
         st.dataframe(pd.DataFrame(output_rows), width="stretch", hide_index=True)
+
+        st.markdown("---")
+        st.subheader("Charge Trend")
+        render_charge_trend_panel(st.session_state.biologic_snapshot)
 
     with history_tab:
         st.subheader("GEIS History Query")

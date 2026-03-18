@@ -18,8 +18,10 @@ namespace Biologic;
 public class ECLabAutomation : ECLabSystem, IDisposable
 {
   private const int MaxEisHistoryCount = 3;
+  private const int MaxChargePointWindow = 1000;
   private readonly ConcurrentDictionary<byte, ChannelDataPoller> channelPollers = new();
   private readonly ConcurrentDictionary<byte, ChannelEisHistory> eisHistoryByChannel = new();
+  private readonly ConcurrentDictionary<byte, ChargeRunState> chargeRunsByChannel = new();
   private readonly CancellationTokenSource cancellationTokenSource = new();
   private readonly IReadOnlyDictionary<string, Action<SequenceResult>> resultPublishers;
   private EventHandler<SequenceCompletedEventArgs>? sequenceCompletedHandler;
@@ -249,6 +251,33 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     }
   }
 
+  public void BeginChargeRun(byte channel, float targetVoltage, float durationSeconds, float recordIntervalSeconds, string? outputFilePath)
+  {
+    string resolvedOutputPath = ResolveChargeOutputPath(channel, outputFilePath);
+    var state = new ChargeRunState
+    {
+      RunId = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+      ChannelIndex = channel,
+      TargetVoltage_V = targetVoltage,
+      Duration_s = durationSeconds,
+      RecordInterval_s = recordIntervalSeconds,
+      StartedAtUtc = DateTime.UtcNow,
+      UpdatedAtUtc = DateTime.UtcNow,
+      Status = "Running",
+      CsvPath = resolvedOutputPath
+    };
+
+    this.chargeRunsByChannel[channel] = state;
+    this.UpdateLatestChargeNodes(channel, state, "[]");
+
+    Log.Information(
+      "Initialized Charge run tracking for channel {Channel}. Target={Voltage}V, Duration={Duration}s, Csv={CsvPath}",
+      channel,
+      targetVoltage,
+      durationSeconds,
+      resolvedOutputPath);
+  }
+
   /// <summary>
   /// Update OPC UA nodes with latest channel data
   /// This is called automatically by the data poller
@@ -290,11 +319,182 @@ public class ECLabAutomation : ECLabSystem, IDisposable
           batch.CurrentValues.Ewe,
           batch.CurrentValues.I);
       }
+
+      this.UpdateChargeRun(batch);
     }
     catch (Exception ex)
     {
       Log.Error(ex, "Error updating OPC UA nodes for channel {Channel}", batch.Channel);
     }
+  }
+
+  private void UpdateChargeRun(ChannelDataBatch batch)
+  {
+    if (!this.chargeRunsByChannel.TryGetValue(batch.Channel, out ChargeRunState? state))
+    {
+      return;
+    }
+
+    string seriesJson;
+    lock (state.SyncRoot)
+    {
+      if (batch.DataInfo.NbRows > 0)
+      {
+        IReadOnlyList<ChargeTimeSeriesPoint> newPoints = ParseChargePoints(batch);
+        if (newPoints.Count > 0)
+        {
+          AppendChargePoints(state, newPoints);
+        }
+      }
+
+      state.UpdatedAtUtc = batch.Timestamp.ToUniversalTime();
+      state.Status = DetermineChargeStatus(state, batch.CurrentValues.State);
+      seriesJson = SequenceDispatcher.Serialize(state.Points);
+    }
+
+    this.UpdateLatestChargeNodes(batch.Channel, state, seriesJson);
+  }
+
+  private void UpdateLatestChargeNodes(byte channelIndex, ChargeRunState state, string seriesJson)
+  {
+    if (!TryGetChannelNode(channelIndex, out Node? channelNode))
+    {
+      return;
+    }
+
+    UpdateNodeValue(channelNode, "LatestChargeStatus", state.Status);
+    UpdateNodeValue(channelNode, "LatestChargeUpdatedAt", state.UpdatedAtUtc.ToString("o", CultureInfo.InvariantCulture));
+    UpdateNodeValue(channelNode, "LatestChargeSeriesJson", seriesJson);
+    UpdateNodeValue(channelNode, "LatestChargePointCount", state.TotalPointCount.ToString(CultureInfo.InvariantCulture));
+    UpdateNodeValue(channelNode, "LatestChargeCsvPath", state.CsvPath);
+  }
+
+  private static IReadOnlyList<ChargeTimeSeriesPoint> ParseChargePoints(ChannelDataBatch batch)
+  {
+    if (batch.BoardType == 0 || batch.DataInfo.NbRows <= 0 || batch.DataInfo.NbCols < 5)
+    {
+      return Array.Empty<ChargeTimeSeriesPoint>();
+    }
+
+    if (batch.TechniqueId != TechniqueId.CA && batch.TechniqueId != TechniqueId.CALIMIT)
+    {
+      return Array.Empty<ChargeTimeSeriesPoint>();
+    }
+
+    int totalWords = Math.Min(batch.DataBuffer.Length, batch.DataInfo.NbRows * batch.DataInfo.NbCols);
+    var points = new List<ChargeTimeSeriesPoint>(batch.DataInfo.NbRows);
+
+    for (int rowIndex = 0; rowIndex < batch.DataInfo.NbRows; rowIndex++)
+    {
+      int offset = rowIndex * batch.DataInfo.NbCols;
+      if (offset + 4 >= totalWords)
+      {
+        break;
+      }
+
+      double timeSeconds = ECLibApi.ConvertTimeChannelNumericIntoSeconds(
+        batch.DataBuffer[offset],
+        batch.DataBuffer[offset + 1],
+        batch.CurrentValues.TimeBase,
+        batch.BoardType);
+
+      float ewe = ECLibApi.ConvertChannelNumericIntoSingle(batch.DataBuffer[offset + 2], batch.BoardType);
+      float current = ECLibApi.ConvertChannelNumericIntoSingle(batch.DataBuffer[offset + 3], batch.BoardType);
+      uint cycle = batch.DataBuffer[offset + 4];
+
+      points.Add(new ChargeTimeSeriesPoint
+      {
+        ChannelIndex = batch.Channel,
+        CapturedAtUtc = batch.Timestamp.ToUniversalTime(),
+        Time_s = timeSeconds,
+        Ewe_V = ewe,
+        I_A = current,
+        Cycle = cycle
+      });
+    }
+
+    return points;
+  }
+
+  private static void AppendChargePoints(ChargeRunState state, IReadOnlyList<ChargeTimeSeriesPoint> newPoints)
+  {
+    if (newPoints.Count == 0)
+    {
+      return;
+    }
+
+    EnsureChargeCsvInitialized(state);
+
+    using var writer = new StreamWriter(new FileStream(state.CsvPath, FileMode.Append, FileAccess.Write, FileShare.Read));
+    foreach (ChargeTimeSeriesPoint point in newPoints)
+    {
+      string pointKey = point.GetStableKey();
+      if (!state.SeenPointKeys.Add(pointKey))
+      {
+        continue;
+      }
+
+      state.Points.Add(point);
+      while (state.Points.Count > MaxChargePointWindow)
+      {
+        state.Points.RemoveAt(0);
+      }
+
+      state.TotalPointCount++;
+      writer.WriteLine(point.ToCsvRow());
+    }
+  }
+
+  private static void EnsureChargeCsvInitialized(ChargeRunState state)
+  {
+    if (state.CsvInitialized)
+    {
+      return;
+    }
+
+    string? directory = Path.GetDirectoryName(state.CsvPath);
+    if (!string.IsNullOrWhiteSpace(directory))
+    {
+      Directory.CreateDirectory(directory);
+    }
+
+    bool shouldWriteHeader = !File.Exists(state.CsvPath) || new FileInfo(state.CsvPath).Length == 0;
+    if (shouldWriteHeader)
+    {
+      using var writer = new StreamWriter(new FileStream(state.CsvPath, FileMode.Create, FileAccess.Write, FileShare.Read));
+      writer.WriteLine("Time(s),Ewe(V),I(A),Cycle");
+    }
+
+    state.CsvInitialized = true;
+  }
+
+  private static string DetermineChargeStatus(ChargeRunState state, int channelState)
+  {
+    if (state.TotalPointCount == 0 && (PROG_STATE)channelState == PROG_STATE.STOP)
+    {
+      return "WaitingForData";
+    }
+
+    return (PROG_STATE)channelState switch
+    {
+      PROG_STATE.RUN => "Running",
+      PROG_STATE.PAUSE => "Paused",
+      PROG_STATE.STOP when state.TotalPointCount > 0 => "Completed",
+      _ => state.Status
+    };
+  }
+
+  private static string ResolveChargeOutputPath(byte channel, string? outputFilePath)
+  {
+    if (!string.IsNullOrWhiteSpace(outputFilePath))
+    {
+      return Path.IsPathRooted(outputFilePath)
+        ? outputFilePath
+        : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Data", outputFilePath);
+    }
+
+    string fileName = $"charge-channel{channel}-{DateTime.UtcNow:yyyyMMdd-HHmmss}.csv";
+    return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Data", fileName);
   }
 
   private void SubscribeResultPublishers()
@@ -527,6 +727,7 @@ internal class ChannelDataPoller
 {
   private readonly ECLabDevice device;
   private readonly byte channel;
+  private readonly uint boardType;
   private readonly int pollingIntervalMs;
   private readonly Action<ChannelDataBatch>? dataHandler;
   private readonly CancellationToken cancellationToken;
@@ -545,6 +746,7 @@ internal class ChannelDataPoller
   {
     this.device = device;
     this.channel = channel;
+    this.boardType = ResolveBoardType(device, channel);
     this.pollingIntervalMs = pollingIntervalMs;
     this.dataHandler = dataHandler;
     this.cancellationToken = cancellationToken;
@@ -598,6 +800,7 @@ internal class ChannelDataPoller
         {
           Timestamp = DateTime.Now,
           Channel = channel,
+          BoardType = boardType,
           CurrentValues = currentValues,
           DataInfo = default,
           DataBuffer = Array.Empty<uint>(),
@@ -652,6 +855,19 @@ internal class ChannelDataPoller
 
     Log.Debug("Poll loop stopped for channel {Channel}", channel);
   }
+
+  private static uint ResolveBoardType(ECLabDevice device, byte channel)
+  {
+    try
+    {
+      return (uint)ECLibApi.GetChannelBoardType(device.DeviceId, channel + 1);
+    }
+    catch (Exception ex)
+    {
+      Log.Warning(ex, "Failed to resolve board type for channel {Channel}. Charge data conversion will be skipped until this succeeds.", channel);
+      return 0;
+    }
+  }
 }
 
 /// <summary>
@@ -667,6 +883,9 @@ public class ChannelDataBatch
 
   /// <summary>Current values at time of acquisition</summary>
   public CurrentValues CurrentValues { get; set; }
+
+  /// <summary>Board type used by BL_ConvertChannelNumericIntoSingle</summary>
+  public uint BoardType { get; set; }
 
   /// <summary>Data information</summary>
   public DataInfo DataInfo { get; set; }
@@ -691,7 +910,9 @@ public class ChannelDataBatch
       int offset = row * DataInfo.NbCols + columnIndex;
       if (offset < DataBuffer.Length)
       {
-        result[row] = ECLibApi.ConvertNumericIntoSingle(DataBuffer[offset]);
+        result[row] = BoardType != 0
+          ? ECLibApi.ConvertChannelNumericIntoSingle(DataBuffer[offset], BoardType)
+          : ECLibApi.ConvertNumericIntoSingle(DataBuffer[offset]);
       }
     }
     return result;
@@ -706,10 +927,13 @@ public class ChannelDataBatch
     for (int row = 0; row < DataInfo.NbRows; row++)
     {
       int offset = row * DataInfo.NbCols;
-      if (offset < DataBuffer.Length)
+      if (offset + 1 < DataBuffer.Length && BoardType != 0)
       {
-        // Time is typically in columns 0-1 (high and low parts)
-        result[row] = CurrentValues.ElapsedTime + (row * CurrentValues.TimeBase);
+        result[row] = ECLibApi.ConvertTimeChannelNumericIntoSeconds(
+          DataBuffer[offset],
+          DataBuffer[offset + 1],
+          CurrentValues.TimeBase,
+          BoardType);
       }
     }
     return result;
@@ -771,4 +995,64 @@ internal sealed class EisResultSnapshot
   public int SpectrumPointCount { get; init; }
 
   public JsonElement Result { get; init; }
+}
+
+internal sealed class ChargeRunState
+{
+  public object SyncRoot { get; } = new();
+
+  public long RunId { get; init; }
+
+  public byte ChannelIndex { get; init; }
+
+  public float TargetVoltage_V { get; init; }
+
+  public float Duration_s { get; init; }
+
+  public float RecordInterval_s { get; init; }
+
+  public DateTime StartedAtUtc { get; init; }
+
+  public DateTime UpdatedAtUtc { get; set; }
+
+  public string Status { get; set; } = "Idle";
+
+  public string CsvPath { get; init; } = string.Empty;
+
+  public bool CsvInitialized { get; set; }
+
+  public int TotalPointCount { get; set; }
+
+  public List<ChargeTimeSeriesPoint> Points { get; } = new();
+
+  public HashSet<string> SeenPointKeys { get; } = new(StringComparer.Ordinal);
+}
+
+internal sealed class ChargeTimeSeriesPoint
+{
+  public byte ChannelIndex { get; init; }
+
+  public DateTime CapturedAtUtc { get; init; }
+
+  public double Time_s { get; init; }
+
+  public float Ewe_V { get; init; }
+
+  public float I_A { get; init; }
+
+  public uint Cycle { get; init; }
+
+  public string GetStableKey()
+  {
+    return string.Create(
+      CultureInfo.InvariantCulture,
+      $"{ChannelIndex}:{Cycle}:{Time_s:F9}:{Ewe_V:F9}:{I_A:F9}");
+  }
+
+  public string ToCsvRow()
+  {
+    return string.Create(
+      CultureInfo.InvariantCulture,
+      $"{Time_s:F9},{Ewe_V:F9},{I_A:F9},{Cycle}");
+  }
 }

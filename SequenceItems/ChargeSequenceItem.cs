@@ -12,7 +12,6 @@ namespace Biologic.SequenceItems;
 public class ChargeSequenceItem : SequenceItem
 {
   private const string PreferredCaVsParameterName = "vs_initial";
-  private const string FallbackCaVsParameterName = "vs_initializer";
   private const float DefaultRecordEveryDt = 1.0f;
   private const float DefaultRecordEveryDi = 0.01f;
 
@@ -22,9 +21,8 @@ public class ChargeSequenceItem : SequenceItem
   private float _duration_s;
   private float _cutoffVoltage_V;
   private float _recordInterval_s;
-  private Dictionary<string, object>? _parameters;
+  private string? _outputFilePath;
   private ECLabDevice? _device;
-  private bool _useVsInitializerLabel;
   private int _defaultIRange = (int)I_RANGE.I_RANGE_AUTO;
   private int _defaultBandwidth = (int)BANDWIDTH.BW_7;
 
@@ -40,6 +38,7 @@ public class ChargeSequenceItem : SequenceItem
       this._duration_s = methodParameter.Duration_s;
       this._cutoffVoltage_V = methodParameter.Voltage_V;
       this._recordInterval_s = methodParameter.RecordInterval_s;
+      this._outputFilePath = methodParameter.OutputFile;
     }
     else
     {
@@ -52,9 +51,11 @@ public class ChargeSequenceItem : SequenceItem
         4.2f);
       this._recordInterval_s = Convert.ToSingle(
         this.Properties.GetValueOrDefault("RecordInterval_s") ??
-        this.Properties.GetValueOrDefault("Record EVERY_dT") ??
         this.Properties.GetValueOrDefault("Record_every_dT") ??
         DefaultRecordEveryDt);
+      this._outputFilePath =
+        this.Properties.GetValueOrDefault("OutputFile")?.ToString() ??
+        this.Properties.GetValueOrDefault("OutputFilePath")?.ToString();
     }
 
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
@@ -79,9 +80,6 @@ public class ChargeSequenceItem : SequenceItem
       throw new InvalidOperationException("Device or DeviceId not found in context");
     }
 
-    this._useVsInitializerLabel = this.Properties.ContainsKey(FallbackCaVsParameterName) &&
-      !this.Properties.ContainsKey(PreferredCaVsParameterName);
-    this._parameters = this.BuildChargeParameters(this._useVsInitializerLabel);
   }
 
   public override Sequence.ResultTypes Execute(Sequence.StateContext context)
@@ -115,6 +113,16 @@ public class ChargeSequenceItem : SequenceItem
 
       this.LoadChargeTechniqueWithFallbacks("ca.ecc");
       ECLibApi.StartChannel(this._deviceId, this._channelIndex + 1);
+
+      if (context.SequenceDispatcher is ECLabAutomation automation)
+      {
+        automation.BeginChargeRun(
+          this._channelIndex,
+          this._cutoffVoltage_V,
+          this._duration_s,
+          this._recordInterval_s,
+          this._outputFilePath);
+      }
 
       Log.Information("Charge started successfully on channel {Channel}", this._channelIndex);
 
@@ -159,42 +167,24 @@ public class ChargeSequenceItem : SequenceItem
   {
   }
 
-  private Dictionary<string, object> BuildChargeParameters(bool useVsInitializerLabel, bool includeHardwareParameters = false, int? iRange = null, int? bandwidth = null, int? eRange = null)
+  private Dictionary<string, object> BuildChargeParameters(bool includeHardwareParameters = false, int? iRange = null, int? bandwidth = null, int? eRange = null)
   {
-    return this.BuildChargeParameters(
-      useVsInitializerLabel,
-      includeHardwareParameters,
-      iRange,
-      bandwidth,
-      eRange,
-      "Record EVERY_dI",
-      "Record EVERY_dT",
-      1);
+    return this.BuildChargeParameters(includeHardwareParameters, iRange, bandwidth, eRange, 1);
   }
 
   private Dictionary<string, object> BuildChargeParameters(
-    bool useVsInitializerLabel,
     bool includeHardwareParameters,
     int? iRange,
     int? bandwidth,
     int? eRange,
-    string recordDiLabel,
-    string recordDtLabel,
     int stepCount)
   {
-    string vsParameterName = useVsInitializerLabel ? FallbackCaVsParameterName : PreferredCaVsParameterName;
-    bool vsInitialValue = this.Properties!.ContainsKey(FallbackCaVsParameterName)
-      ? Convert.ToBoolean(this.Properties[FallbackCaVsParameterName])
-      : this.Properties.ContainsKey(PreferredCaVsParameterName)
+    bool vsInitialValue = this.Properties!.ContainsKey(PreferredCaVsParameterName)
         ? Convert.ToBoolean(this.Properties[PreferredCaVsParameterName])
         : false;
 
-    float voltageStep = this.Properties.ContainsKey("Voltage_step")
-      ? Convert.ToSingle(this.Properties["Voltage_step"])
-      : this._cutoffVoltage_V;
-    float durationStep = this.Properties.ContainsKey("Duration_step")
-      ? Convert.ToSingle(this.Properties["Duration_step"])
-      : this._duration_s;
+    float voltageStep = this._cutoffVoltage_V;
+    float durationStep = this._duration_s;
 
     object voltageValue = stepCount > 1 ? CreateRepeatedFloatArray(voltageStep, stepCount) : voltageStep;
     object durationValue = stepCount > 1 ? CreateRepeatedFloatArray(durationStep, stepCount) : durationStep;
@@ -203,7 +193,7 @@ public class ChargeSequenceItem : SequenceItem
     var parameters = new Dictionary<string, object>
     {
       ["Voltage_step"] = voltageValue,
-      [vsParameterName] = vsValue,
+      [PreferredCaVsParameterName] = vsValue,
       ["Duration_step"] = durationValue,
       ["Step_number"] = this.Properties.ContainsKey("Step_number")
         ? Convert.ToInt32(this.Properties["Step_number"])
@@ -211,20 +201,10 @@ public class ChargeSequenceItem : SequenceItem
       ["N_Cycles"] = this.Properties.ContainsKey("N_Cycles")
         ? Convert.ToInt32(this.Properties["N_Cycles"])
         : 1,
-      [recordDiLabel] = this.Properties.ContainsKey(recordDiLabel)
-        ? Convert.ToSingle(this.Properties[recordDiLabel])
-        : recordDiLabel == "Record EVERY_dI" && this.Properties.ContainsKey("Record_every_dI")
-          ? Convert.ToSingle(this.Properties["Record_every_dI"])
-        : this.Properties.ContainsKey("Record_every_dI")
+      ["Record_every_dI"] = this.Properties.ContainsKey("Record_every_dI")
           ? Convert.ToSingle(this.Properties["Record_every_dI"])
           : DefaultRecordEveryDi,
-      [recordDtLabel] = this.Properties.ContainsKey(recordDtLabel)
-        ? Convert.ToSingle(this.Properties[recordDtLabel])
-        : recordDtLabel == "Record EVERY_dT" && this.Properties.ContainsKey("Record_every_dT")
-          ? Convert.ToSingle(this.Properties["Record_every_dT"])
-        : this.Properties.ContainsKey("Record_every_dT")
-          ? Convert.ToSingle(this.Properties["Record_every_dT"])
-          : this._recordInterval_s
+        ["Record_every_dT"] = this._recordInterval_s
     };
 
     if (includeHardwareParameters)
@@ -248,19 +228,12 @@ public class ChargeSequenceItem : SequenceItem
     string[] techniqueCandidates = [preferredTechniqueFile, "ca.ecc", "ca4.ecc", "ca5.ecc"];
     var attempts = new List<(string Name, Dictionary<string, object> Parameters)>();
     int resolvedERange = SelectERange(this._cutoffVoltage_V);
-    attempts.Add(("vs_initializer/manual-minimal", this.BuildChargeParameters(true, false, null, null, null, "Record EVERY_dI", "Record EVERY_dT", 1)));
-    attempts.Add(("vs_initializer/manual-three-step", this.BuildChargeParameters(true, false, null, null, null, "Record EVERY_dI", "Record EVERY_dT", 3)));
-    attempts.Add(("vs_initial/example-minimal", this.BuildChargeParameters(false, false, null, null, null, "Record_every_dI", "Record_every_dT", 1)));
-    attempts.Add(("vs_initial/example-three-step", this.BuildChargeParameters(false, false, null, null, null, "Record_every_dI", "Record_every_dT", 3)));
-    attempts.Add(("vs_initial/example-three-step-uppercase-records", this.BuildChargeParameters(false, false, null, null, null, "Record EVERY_dI", "Record EVERY_dT", 3)));
-    attempts.Add(("vs_initializer/with-e-range", this.BuildChargeParameters(true, true, null, null, resolvedERange, "Record EVERY_dI", "Record EVERY_dT", 1)));
-    attempts.Add(("vs_initial/with-e-range", this.BuildChargeParameters(false, true, null, null, resolvedERange, "Record_every_dI", "Record_every_dT", 1)));
-    attempts.Add(("vs_initializer/with-auto-e-range", this.BuildChargeParameters(true, true, null, null, (int)E_RANGE.E_RANGE_AUTO, "Record EVERY_dI", "Record EVERY_dT", 1)));
-    attempts.Add(("vs_initial/with-auto-e-range", this.BuildChargeParameters(false, true, null, null, (int)E_RANGE.E_RANGE_AUTO, "Record_every_dI", "Record_every_dT", 1)));
-    attempts.Add(("vs_initial/with-hardware", this.BuildChargeParameters(false, true, null, null, null, "Record_every_dI", "Record_every_dT", 1)));
-    attempts.Add(("vs_initializer/with-hardware", this.BuildChargeParameters(true, true, null, null, null, "Record EVERY_dI", "Record EVERY_dT", 1)));
-    attempts.Add(("vs_initial/with-auto-range", this.BuildChargeParameters(false, true, (int)I_RANGE.I_RANGE_AUTO, (int)BANDWIDTH.BW_7, (int)E_RANGE.E_RANGE_AUTO, "Record_every_dI", "Record_every_dT", 1)));
-    attempts.Add(("vs_initializer/with-auto-range", this.BuildChargeParameters(true, true, (int)I_RANGE.I_RANGE_AUTO, (int)BANDWIDTH.BW_7, (int)E_RANGE.E_RANGE_AUTO, "Record EVERY_dI", "Record EVERY_dT", 1)));
+    attempts.Add(("vs_initial/minimal", this.BuildChargeParameters(false, null, null, null, 1)));
+    attempts.Add(("vs_initial/three-step", this.BuildChargeParameters(false, null, null, null, 3)));
+    attempts.Add(("vs_initial/with-e-range", this.BuildChargeParameters(true, null, null, resolvedERange, 1)));
+    attempts.Add(("vs_initial/with-auto-e-range", this.BuildChargeParameters(true, null, null, (int)E_RANGE.E_RANGE_AUTO, 1)));
+    attempts.Add(("vs_initial/with-hardware", this.BuildChargeParameters(true, null, null, null, 1)));
+    attempts.Add(("vs_initial/with-auto-range", this.BuildChargeParameters(true, (int)I_RANGE.I_RANGE_AUTO, (int)BANDWIDTH.BW_7, (int)E_RANGE.E_RANGE_AUTO, 1)));
 
     Exception? lastException = null;
 
@@ -288,7 +261,6 @@ public class ChargeSequenceItem : SequenceItem
 
         try
         {
-          this._parameters = attempt.Parameters;
           Log.Information("Trying CA parameter variant: {VariantName}", $"{techniqueFile}/{attempt.Name}");
           this.PopulateEccParams(ref eccParams, this.BuildEccParamArray(attempt.Parameters));
 
@@ -301,7 +273,6 @@ public class ChargeSequenceItem : SequenceItem
             last: true,
             display: false);
 
-          this._useVsInitializerLabel = attempt.Name.Contains("vs_initializer", StringComparison.Ordinal);
           return;
         }
         catch (ECLibException ex) when (ex.ErrorCode == (int)BL_ERROR.GEN_INVALIDPARAMETERS || ex.ErrorCode == (int)BL_ERROR.TECH_LOADTECHNIQUEFAILED)
@@ -360,11 +331,6 @@ public class ChargeSequenceItem : SequenceItem
       this.AddSingleParameters(paramList, "Voltage_step", parameters["Voltage_step"]);
     }
 
-    if (parameters.ContainsKey("vs_initializer"))
-    {
-      this.AddBoolParameters(paramList, "vs_initializer", parameters["vs_initializer"]);
-    }
-
     if (parameters.ContainsKey("vs_initial"))
     {
       this.AddBoolParameters(paramList, "vs_initial", parameters["vs_initial"]);
@@ -390,19 +356,9 @@ public class ChargeSequenceItem : SequenceItem
       paramList.Add(ECLibApi.DefineSingleParameter("Record_every_dI", Convert.ToSingle(parameters["Record_every_dI"]), 0));
     }
 
-    if (parameters.ContainsKey("Record EVERY_dI"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Record EVERY_dI", Convert.ToSingle(parameters["Record EVERY_dI"]), 0));
-    }
-
     if (parameters.ContainsKey("Record_every_dT"))
     {
       paramList.Add(ECLibApi.DefineSingleParameter("Record_every_dT", Convert.ToSingle(parameters["Record_every_dT"]), 0));
-    }
-
-    if (parameters.ContainsKey("Record EVERY_dT"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Record EVERY_dT", Convert.ToSingle(parameters["Record EVERY_dT"]), 0));
     }
 
     if (parameters.ContainsKey("I_Range"))
