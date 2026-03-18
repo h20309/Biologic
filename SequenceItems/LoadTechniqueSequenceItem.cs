@@ -32,6 +32,8 @@ public class LoadTechniqueSequenceItem : SequenceItem
       _parameters = Properties["Parameters"] as Dictionary<string, object>;
     }
 
+    ApplyMethodParameterOverrides(context.MethodParameter);
+
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
     if (device is ECLabDevice ecLabDevice && device.GetProperty("DeviceId") is int deviceId)
@@ -201,5 +203,33 @@ public class LoadTechniqueSequenceItem : SequenceItem
     }
 
     return paramList.ToArray();
+  }
+
+  private void ApplyMethodParameterOverrides(object? methodParameter)
+  {
+    switch (methodParameter)
+    {
+      case Biologic.MethodParameters.RunOCV ocv when string.Equals(_techniqueFile, "ocv.ecc", StringComparison.OrdinalIgnoreCase):
+        _channelIndex = Convert.ToByte(ocv.ChannelIndex);
+        _parameters = CloneParameters(_parameters);
+        _parameters["Rest_time_T"] = ocv.Duration_s;
+        break;
+      case Biologic.MethodParameters.RunCV cv when _techniqueFile.StartsWith("cv", StringComparison.OrdinalIgnoreCase):
+        _channelIndex = Convert.ToByte(cv.ChannelIndex);
+        _parameters = CloneParameters(_parameters);
+        _parameters["Ei"] = cv.StartVoltage_V;
+        _parameters["E1"] = cv.Vertex1_V;
+        _parameters["E2"] = cv.Vertex2_V;
+        _parameters["dE/dt"] = cv.ScanRate_V_s;
+        _parameters["N_Cycles"] = cv.NCycles;
+        break;
+    }
+  }
+
+  private static Dictionary<string, object> CloneParameters(Dictionary<string, object>? parameters)
+  {
+    return parameters != null
+      ? new Dictionary<string, object>(parameters, StringComparer.Ordinal)
+      : new Dictionary<string, object>(StringComparer.Ordinal);
   }
 }

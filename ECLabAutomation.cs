@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text.Json;
 using Biologic.Communications;
@@ -90,12 +91,17 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   /// Start the automation system
   /// </summary>
   /// <remarks>
-  /// Note: Polling is auto-started after device connection in ConnectDeviceSequenceItem,
-  /// not here, because the device may not be connected yet when Start() is called.
+  /// Polling is ensured after dispatcher startup because devices are opened during base.Start().
+  /// ConnectDeviceSequenceItem also re-checks polling so explicit connect requests remain idempotent.
   /// </remarks>
   public new void Start()
   {
     base.Start();
+
+    if (this.IsPollingEnabled)
+    {
+      this.EnsurePollingForConnectedChannels();
+    }
   }
 
   /// <summary>
@@ -143,6 +149,47 @@ public class ECLabAutomation : ECLabSystem, IDisposable
       poller.Start();
       Log.Information("Started OPC UA polling for channel {Channel} with interval {Interval}ms",
         channel, pollingIntervalMs);
+    }
+  }
+
+  /// <summary>
+  /// Ensure polling is active for all currently connected channels.
+  /// Safe to call repeatedly.
+  /// </summary>
+  public void EnsurePollingForConnectedChannels()
+  {
+    if (!this.IsPollingEnabled)
+    {
+      return;
+    }
+
+    var device = this.devices.Values.FirstOrDefault() as ECLabDevice;
+    if (device == null)
+    {
+      Log.Warning("Cannot ensure polling: device not found");
+      return;
+    }
+
+    if (!device.IsConnected || !device.HasAvailableChannels)
+    {
+      Log.Information("Skipping polling startup because device is not connected or has no available channels yet");
+      return;
+    }
+
+    try
+    {
+      int[] channels = ECLibApi.GetChannelsPlugged(device.DeviceId);
+      foreach (int ch in channels)
+      {
+        byte channel = (byte)(ch - 1);
+        this.StartPolling(channel);
+      }
+
+      Log.Information("Ensured data polling for {Count} connected channel(s)", channels.Length);
+    }
+    catch (Exception ex)
+    {
+      Log.Warning(ex, "Failed to ensure polling for connected channels");
     }
   }
 
@@ -226,17 +273,22 @@ public class ECLabAutomation : ECLabSystem, IDisposable
       UpdateNodeValue(channelNode, "Voltage", batch.CurrentValues.Ewe.ToString(System.Globalization.CultureInfo.InvariantCulture));
       UpdateNodeValue(channelNode, "Current", batch.CurrentValues.I.ToString(System.Globalization.CultureInfo.InvariantCulture));
       UpdateNodeValue(channelNode, "ElapsedTime", batch.CurrentValues.ElapsedTime.ToString(System.Globalization.CultureInfo.InvariantCulture));
-      UpdateNodeValue(channelNode, "Technique", batch.TechniqueId.ToString());
+      if (batch.DataInfo.NbRows > 0)
+      {
+        UpdateNodeValue(channelNode, "Technique", batch.TechniqueId.ToString());
+      }
+      else if ((PROG_STATE)batch.CurrentValues.State == PROG_STATE.STOP)
+      {
+        UpdateNodeValue(channelNode, "Technique", "Idle");
+      }
+
+      UpdateNodeValue(channelNode, "DataRows", batch.DataInfo.NbRows.ToString(System.Globalization.CultureInfo.InvariantCulture));
+      UpdateNodeValue(channelNode, "DataCols", batch.DataInfo.NbCols.ToString(System.Globalization.CultureInfo.InvariantCulture));
+      UpdateNodeValue(channelNode, "LastUpdate", batch.Timestamp.ToUniversalTime().ToString("o"));
 
       // Update data statistics
       if (batch.DataInfo.NbRows > 0)
       {
-        UpdateNodeValue(channelNode, "DataRows", batch.DataInfo.NbRows.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        UpdateNodeValue(channelNode, "DataCols", batch.DataInfo.NbCols.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        
-        // Update LastUpdate as ISO 8601 DateTime string for OPC UA DateTime type
-        UpdateNodeValue(channelNode, "LastUpdate", batch.Timestamp.ToUniversalTime().ToString("o"));
-
         Log.Debug("Updated OPC UA nodes for channel {Channel}: Rows={Rows}, State={State}, V={V:F6}V, I={I:F9}A",
           batch.Channel, batch.DataInfo.NbRows,
           (PROG_STATE)batch.CurrentValues.State,
@@ -346,7 +398,7 @@ public class ECLabAutomation : ECLabSystem, IDisposable
       snapshot.SpectrumPointCount);
   }
 
-  private bool TryGetChannelNode(byte channel, out Node? channelNode)
+  private bool TryGetChannelNode(byte channel, [NotNullWhen(true)] out Node? channelNode)
   {
     channelNode = null;
 
@@ -541,67 +593,54 @@ internal class ChannelDataPoller
     {
       try
       {
-        // Get current values to check if channel is running
         if (!device.GetCurrentValues(channel, out CurrentValues currentValues))
         {
           await Task.Delay(pollingIntervalMs, cancellationToken);
           continue;
         }
 
-        // Only get data if channel is running
-        if (currentValues.State != (int)PROG_STATE.RUN)
+        var batch = new ChannelDataBatch
         {
-          await Task.Delay(pollingIntervalMs, cancellationToken);
-          continue;
-        }
+          Timestamp = DateTime.Now,
+          Channel = channel,
+          CurrentValues = currentValues,
+          DataInfo = default,
+          DataBuffer = Array.Empty<uint>(),
+          TechniqueId = latestBatch?.TechniqueId ?? default
+        };
 
-        // Get data batch
-        try
+        if ((PROG_STATE)currentValues.State == PROG_STATE.RUN)
         {
-          var (values, dataInfo, dataBuffer) = ECLibApi.GetData(
-              device.GetProperty("DeviceId") as int? ?? 0,
-              channel + 1); // Convert to 1-based
-
-          if (dataInfo.NbRows > 0)
+          try
           {
-            var batch = new ChannelDataBatch
+            var (dataCurrentValues, dataInfo, dataBuffer) = ECLibApi.GetData(device.DeviceId, channel + 1);
+            batch.CurrentValues = dataCurrentValues;
+            batch.DataInfo = dataInfo;
+            batch.DataBuffer = dataBuffer;
+            if (dataInfo.NbRows > 0)
             {
-              Timestamp = DateTime.Now,
-              Channel = channel,
-              CurrentValues = values,
-              DataInfo = dataInfo,
-              DataBuffer = dataBuffer,
-              TechniqueId = (TechniqueId)dataInfo.TechniqueID
-            };
-
-            // Update latest batch
-            latestBatch = batch;
-
-            // Add to cache
-            dataCache.Enqueue(batch);
-
-            // Trim cache if too large
-            while (dataCache.Count > maxCacheSize)
-            {
-              dataCache.TryDequeue(out _);
+              batch.TechniqueId = (TechniqueId)dataInfo.TechniqueID;
             }
-
-            // Call handler if provided
-            dataHandler?.Invoke(batch);
-
-            Log.Debug(
-                "Polled {Rows} data points from channel {Channel}, technique {Technique}",
-                dataInfo.NbRows,
-                channel,
-                (TechniqueId)dataInfo.TechniqueID);
+          }
+          catch (ECLibException ex)
+          {
+            Log.Warning(ex, "Error getting data for channel {Channel}; publishing live state only for this poll cycle", channel);
           }
         }
-        catch (ECLibException ex)
+
+        latestBatch = batch;
+
+        if (batch.DataInfo.NbRows > 0)
         {
-          Log.Warning("Error getting data for channel {Channel}: {Error}", channel, ex.Message);
+          dataCache.Enqueue(batch);
+          while (dataCache.Count > maxCacheSize)
+          {
+            dataCache.TryDequeue(out _);
+          }
         }
 
-        // Wait for next poll
+        dataHandler?.Invoke(batch);
+
         await Task.Delay(pollingIntervalMs, cancellationToken);
       }
       catch (OperationCanceledException)

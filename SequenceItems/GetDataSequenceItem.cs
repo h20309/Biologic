@@ -23,7 +23,16 @@ public class GetDataSequenceItem : SequenceItem
       throw new ArgumentNullException(nameof(Properties));
 
     _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
-    _outputFilePath = Properties.GetValueOrDefault("OutputFile")?.ToString() ?? "data.csv";
+    if (TryGetMethodChannelIndex(context.MethodParameter, out byte methodChannelIndex))
+    {
+      _channelIndex = methodChannelIndex;
+    }
+
+    _outputFilePath =
+      TryGetMethodOutputFile(context.MethodParameter) ??
+      Properties.GetValueOrDefault("OutputFilePath")?.ToString() ??
+      Properties.GetValueOrDefault("OutputFile")?.ToString() ??
+      "data.csv";
     _maxDataPoints = Convert.ToInt32(Properties.GetValueOrDefault("MaxDataPoints") ?? 10000);
     _appendData = Convert.ToBoolean(Properties.GetValueOrDefault("AppendData") ?? false);
 
@@ -224,5 +233,41 @@ public class GetDataSequenceItem : SequenceItem
     {
       Directory.CreateDirectory(directory);
     }
+  }
+
+  private static bool TryGetMethodChannelIndex(object? methodParameter, out byte channelIndex)
+  {
+    channelIndex = 0;
+    switch (methodParameter)
+    {
+      case Biologic.MethodParameters.RunCV cv:
+        channelIndex = Convert.ToByte(cv.ChannelIndex);
+        return true;
+      case Biologic.MethodParameters.RunOCV ocv:
+        channelIndex = Convert.ToByte(ocv.ChannelIndex);
+        return true;
+      case Biologic.MethodParameters.RunPEIS peis:
+        channelIndex = Convert.ToByte(peis.ChannelIndex);
+        return true;
+      case Biologic.MethodParameters.RunGEIS geis:
+        channelIndex = Convert.ToByte(geis.ChannelIndex);
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private static string? TryGetMethodOutputFile(object? methodParameter)
+  {
+    return methodParameter switch
+    {
+      Biologic.MethodParameters.RunCV cv => cv.OutputFile,
+      Biologic.MethodParameters.RunOCV ocv => ocv.OutputFile,
+      Biologic.MethodParameters.RunPEIS peis => peis.OutputFile,
+      Biologic.MethodParameters.RunGEIS geis => geis.OutputFile,
+      Biologic.MethodParameters.Charge charge => charge.OutputFile,
+      Biologic.MethodParameters.Discharge discharge => discharge.OutputFile,
+      _ => null,
+    };
   }
 }

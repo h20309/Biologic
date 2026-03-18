@@ -16,6 +16,7 @@ public class DischargeSequenceItem : SequenceItem
   private float _current_A;
   private float _duration_s;
   private float _cutoffVoltage_V;
+  private float _recordInterval_s;
   private Dictionary<string, object>? _parameters;
   private ECLabDevice? _device;
 
@@ -24,10 +25,25 @@ public class DischargeSequenceItem : SequenceItem
     if (Properties == null)
       throw new ArgumentNullException(nameof(Properties));
 
-    _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
-    _current_A = Convert.ToSingle(Properties.GetValueOrDefault("Current_A") ?? -0.001);
-    _duration_s = Convert.ToSingle(Properties.GetValueOrDefault("Duration_s") ?? 3600);
-    _cutoffVoltage_V = Convert.ToSingle(Properties.GetValueOrDefault("CutoffVoltage_V") ?? 2.5);
+    if (context.MethodParameter is Biologic.MethodParameters.Discharge methodParameter)
+    {
+      _channelIndex = Convert.ToByte(methodParameter.ChannelIndex);
+      _current_A = Convert.ToSingle(Properties.GetValueOrDefault("Current_A") ?? -0.001f);
+      _duration_s = methodParameter.Duration_s;
+      _cutoffVoltage_V = methodParameter.Voltage_V;
+      _recordInterval_s = methodParameter.RecordInterval_s;
+    }
+    else
+    {
+      _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
+      _current_A = Convert.ToSingle(Properties.GetValueOrDefault("Current_A") ?? -0.001f);
+      _duration_s = Convert.ToSingle(Properties.GetValueOrDefault("Duration_s") ?? 3600.0f);
+      _cutoffVoltage_V = Convert.ToSingle(
+        Properties.GetValueOrDefault("Voltage_V") ??
+        Properties.GetValueOrDefault("CutoffVoltage_V") ??
+        2.5f);
+      _recordInterval_s = Convert.ToSingle(Properties.GetValueOrDefault("RecordInterval_s") ?? 1.0f);
+    }
 
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
@@ -48,7 +64,7 @@ public class DischargeSequenceItem : SequenceItem
       ["Duration_step"] = _duration_s,
       ["Voltage_limit"] = _cutoffVoltage_V,
       ["Record_every_dE"] = 0.01f,
-      ["Record_every_dt"] = 1.0f,
+      ["Record_every_dt"] = _recordInterval_s,
       ["N_Cycles"] = 1
     };
   }
@@ -130,7 +146,8 @@ public class DischargeSequenceItem : SequenceItem
           Message = $"Discharging started on channel {_channelIndex}",
           Current_A = _current_A,
           Duration_s = _duration_s,
-          CutoffVoltage_V = _cutoffVoltage_V
+          CutoffVoltage_V = _cutoffVoltage_V,
+          RecordInterval_s = _recordInterval_s
         };
 
         return Sequence.ResultTypes.Next;

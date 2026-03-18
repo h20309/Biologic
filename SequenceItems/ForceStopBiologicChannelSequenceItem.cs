@@ -28,7 +28,14 @@ public class ForceStopBiologicChannelSequenceItem : SequenceItem
     if (Properties == null)
       throw new ArgumentNullException(nameof(Properties));
 
-    _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
+    if (context.MethodParameter is MethodParameters.ForceStopChannel forceStopChannel)
+    {
+      _channelIndex = Convert.ToByte(forceStopChannel.ChannelIndex);
+    }
+    else
+    {
+      _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
+    }
 
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
     if (device != null && device.GetProperty("DeviceId") is int deviceId)

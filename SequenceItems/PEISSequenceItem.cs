@@ -18,6 +18,7 @@ public class PEISSequenceItem : SequenceItem
   private int _frequencyPoints;
   private float _dcVoltage_V;
   private float _acAmplitude_V;
+  private string? _outputFile;
   private Dictionary<string, object>? _parameters;
   private ECLabDevice? _device;
 
@@ -26,12 +27,26 @@ public class PEISSequenceItem : SequenceItem
     if (Properties == null)
       throw new ArgumentNullException(nameof(Properties));
 
-    _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
-    _initialFrequency_Hz = Convert.ToSingle(Properties.GetValueOrDefault("InitialFrequency_Hz") ?? 100000);
-    _finalFrequency_Hz = Convert.ToSingle(Properties.GetValueOrDefault("FinalFrequency_Hz") ?? 0.01);
-    _frequencyPoints = Convert.ToInt32(Properties.GetValueOrDefault("FrequencyPoints") ?? 10);
-    _dcVoltage_V = Convert.ToSingle(Properties.GetValueOrDefault("DcVoltage_V") ?? 0.0);
-    _acAmplitude_V = Convert.ToSingle(Properties.GetValueOrDefault("AcAmplitude_V") ?? 0.01);
+    if (context.MethodParameter is Biologic.MethodParameters.RunPEIS methodParameter)
+    {
+      _channelIndex = Convert.ToByte(methodParameter.ChannelIndex);
+      _initialFrequency_Hz = methodParameter.InitialFrequency_Hz;
+      _finalFrequency_Hz = methodParameter.FinalFrequency_Hz;
+      _frequencyPoints = methodParameter.FrequencyPoints;
+      _dcVoltage_V = methodParameter.DcVoltage_V;
+      _acAmplitude_V = methodParameter.AcAmplitude_V;
+      _outputFile = methodParameter.OutputFile;
+    }
+    else
+    {
+      _channelIndex = Convert.ToByte(Properties.GetValueOrDefault("ChannelIndex") ?? 0);
+      _initialFrequency_Hz = Convert.ToSingle(Properties.GetValueOrDefault("InitialFrequency_Hz") ?? 100000);
+      _finalFrequency_Hz = Convert.ToSingle(Properties.GetValueOrDefault("FinalFrequency_Hz") ?? 0.01);
+      _frequencyPoints = Convert.ToInt32(Properties.GetValueOrDefault("FrequencyPoints") ?? 10);
+      _dcVoltage_V = Convert.ToSingle(Properties.GetValueOrDefault("DcVoltage_V") ?? 0.0);
+      _acAmplitude_V = Convert.ToSingle(Properties.GetValueOrDefault("AcAmplitude_V") ?? 0.01);
+      _outputFile = Properties.GetValueOrDefault("OutputFile")?.ToString();
+    }
 
     // Get device ID from Device properties
     var device = context.SequenceDispatcher.Devices.Values.FirstOrDefault();
@@ -133,7 +148,8 @@ public class PEISSequenceItem : SequenceItem
           FinalFrequency_Hz = _finalFrequency_Hz,
           FrequencyPoints = _frequencyPoints,
           DcVoltage_V = _dcVoltage_V,
-          AcAmplitude_V = _acAmplitude_V
+          AcAmplitude_V = _acAmplitude_V,
+          OutputFile = _outputFile
         };
 
         return Sequence.ResultTypes.Next;

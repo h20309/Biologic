@@ -34,6 +34,11 @@ public class ConnectDeviceSequenceItem : SequenceItem
           "ECLab device is already connected and initialized with {ChannelCount} channel(s); skipping duplicate connect",
           ecLabDevice.GetProperty("ChannelCount"));
 
+        if (context.SequenceDispatcher is ECLabAutomation alreadyConnectedAutomation)
+        {
+          alreadyConnectedAutomation.EnsurePollingForConnectedChannels();
+        }
+
         DeviceControlSoftware.MethodParameters.ResultData alreadyConnected = new(true, "Device already connected");
         context.ResultParameter = alreadyConnected;
         return Sequence.ResultTypes.Next;
@@ -68,18 +73,7 @@ public class ConnectDeviceSequenceItem : SequenceItem
       {
         try
         {
-          // Get all plugged channels
-          int deviceId = ecLabDevice.DeviceId;
-          int[] channels = ECLibApi.GetChannelsPlugged(deviceId);
-          
-          // Start polling for all connected channels
-          foreach (int ch in channels)
-          {
-            byte channel = (byte)(ch - 1); // Convert to 0-based
-            automation.StartPolling(channel);
-          }
-          
-          Log.Information("Auto-started data polling for {Count} connected channel(s)", channels.Length);
+          automation.EnsurePollingForConnectedChannels();
         }
         catch (Exception ex)
         {

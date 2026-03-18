@@ -105,4 +105,10 @@ public class MethodParameters
     float Duration_s,
     float RecordInterval_s = 1.0f,
     string? OutputFile = null);
+
+  /// <summary>
+  /// Parameters for force stopping the active sequence on a channel
+  /// </summary>
+  /// <param name="ChannelIndex">Zero-based channel index (0-15)</param>
+  public record ForceStopChannel(int ChannelIndex);
 }

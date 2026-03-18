@@ -10,25 +10,21 @@ import streamlit as st
 from asyncua import Client
 
 from opcua_connect import (
+    DEFAULT_CHANNEL_NODE_ID,
     DEFAULT_MONITOR_NODES,
+    discover_biologic_layout,
+    get_biologic_method_node_ids,
+    get_biologic_channel_node_id,
+    get_opcua_node,
     refresh_dashboard,
     render_status,
+    resolve_biologic_method_target,
     resolve_monitor_nodes,
     set_status,
 )
 
 
-FUNCTION_SET_NODE_ID = "ns=3;i=5009"
-DEFAULT_CHANNEL_NODE_ID = "ns=3;i=5002"
 DISCOVERY_REQUEST_TIMEOUT = 1.5
-
-METHOD_NODE_IDS: Dict[str, str] = {
-    "RunOCV": "ns=3;i=7000",
-    "RunPEIS": "ns=3;i=7001",
-    "RunGEIS": "ns=3;i=7004",
-    "Charge": "ns=3;i=7005",
-    "Discharge": "ns=3;i=7009",
-}
 
 METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
     "RunOCV": [
@@ -98,7 +94,7 @@ METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
     ],
     "Charge": [
         {"name": "ChannelIndex", "type": "int", "label": "Channel Index", "default": 0, "min": 0, "max": 15},
-        {"name": "Voltage_V", "type": "float", "label": "Voltage (V)", "default": 4.2, "step": 0.01},
+        {"name": "Voltage_V", "type": "float", "label": "Target Voltage (V)", "default": 4.2, "step": 0.01},
         {"name": "Duration_s", "type": "float", "label": "Duration (s)", "default": 3600.0, "min": 0.1, "step": 1.0},
         {
             "name": "RecordInterval_s",
@@ -112,7 +108,7 @@ METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
     ],
     "Discharge": [
         {"name": "ChannelIndex", "type": "int", "label": "Channel Index", "default": 0, "min": 0, "max": 15},
-        {"name": "Voltage_V", "type": "float", "label": "Voltage (V)", "default": 2.5, "step": 0.01},
+        {"name": "Voltage_V", "type": "float", "label": "Cutoff Voltage (V)", "default": 2.5, "step": 0.01},
         {"name": "Duration_s", "type": "float", "label": "Duration (s)", "default": 3600.0, "min": 0.1, "step": 1.0},
         {
             "name": "RecordInterval_s",
@@ -123,6 +119,9 @@ METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
             "step": 0.1,
         },
         {"name": "OutputFile", "type": "text", "label": "Output File", "default": ""},
+    ],
+    "ForceStopChannel": [
+        {"name": "ChannelIndex", "type": "int", "label": "Channel Index", "default": 0, "min": 0, "max": 15},
     ],
 }
 
@@ -162,7 +161,7 @@ async def browse_opcua_object(server_url: str, object_node_id: str) -> Dict[str,
     try:
         await client.connect()
         connected = True
-        obj_node = client.get_node(object_node_id)
+        obj_node = get_opcua_node(client, object_node_id)
         children = await obj_node.get_children()
         variables: List[Dict[str, str]] = []
 
@@ -177,7 +176,7 @@ async def browse_opcua_object(server_url: str, object_node_id: str) -> Dict[str,
 
                 try:
                     data_type_id = await child.read_data_type()
-                    data_type_node = client.get_node(data_type_id)
+                    data_type_node = get_opcua_node(client, data_type_id)
                     data_type_name = await data_type_node.read_browse_name()
                     type_str = str(data_type_name.Name)
                 except Exception:
@@ -212,26 +211,92 @@ async def call_biologic_method(server_url: str, method_name: str, payload: Dict[
     try:
         await client.connect()
         connected = True
-        function_set_node = client.get_node(FUNCTION_SET_NODE_ID)
+        biologic_layout = await discover_biologic_layout(server_url)
+        method_target = resolve_biologic_method_target(method_name, biologic_layout)
+        if method_target is None:
+            return {
+                "success": False,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "server_url": server_url,
+                "method": method_name,
+                "payload": payload,
+                "error": f"Method target could not be resolved for {method_name}.",
+            }
+
+        resolved_node_ids = get_biologic_method_node_ids(server_url, method_name)
+        if resolved_node_ids is None:
+            return {
+                "success": False,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "server_url": server_url,
+                "method": method_name,
+                "payload": payload,
+                "error": f"Method NodeIds could not be resolved for {method_name}.",
+            }
+
+        function_set_node = get_opcua_node(client, resolved_node_ids["function_set_node_id"])
+        method_node = get_opcua_node(client, resolved_node_ids["method_node_id"])
+        input_arguments = []
+
+        try:
+            for child in await method_node.get_children():
+                browse_name = await child.read_browse_name()
+                if str(browse_name.Name) != "InputArguments":
+                    continue
+                input_arguments = await child.read_value()
+                break
+        except Exception:
+            input_arguments = []
+
+        if isinstance(input_arguments, list) and len(input_arguments) == 0:
+            return {
+                "success": False,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "server_url": server_url,
+                "method": method_name,
+                "payload": payload,
+                "function_set_node_id": method_target["function_set_node_id"],
+                "method_node_id": method_target["method_node_id"],
+                "error": (
+                    f"The OPC UA server currently exposes {method_name} with 0 input arguments. "
+                    "This client sends one JSON string argument, so the live server model is out of sync with the Biologic runtime. "
+                    "Update the Biologic NodeSet/open62541 wrapper, rebuild, and restart ORBIT."
+                ),
+            }
+
         payload_text = json.dumps(payload)
-        raw_result = await function_set_node.call_method(METHOD_NODE_IDS[method_name], payload_text)
+        raw_result = await function_set_node.call_method(resolved_node_ids["method_node_id"], payload_text)
         normalized_result = normalize_method_result(raw_result)
 
         return {
             "success": True,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "server_url": server_url,
             "method": method_name,
             "payload": payload,
+            "function_set_node_id": method_target["function_set_node_id"],
+            "method_node_id": method_target["method_node_id"],
             "raw_response": normalized_result,
             "parsed_response": safe_parse_json(normalized_result),
         }
     except Exception as ex:
+        biologic_layout = await discover_biologic_layout(server_url)
+        method_target = resolve_biologic_method_target(method_name, biologic_layout)
+        detailed_error = str(ex)
+        if "BadNoMatch" in detailed_error and method_target is not None:
+            detailed_error = (
+                f"{detailed_error} | Server={server_url} | "
+                f"FunctionSet={method_target['function_set_node_id']} | Method={method_target['method_node_id']}"
+            )
         return {
             "success": False,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "server_url": server_url,
             "method": method_name,
             "payload": payload,
-            "error": str(ex),
+            "function_set_node_id": method_target["function_set_node_id"] if method_target else None,
+            "method_node_id": method_target["method_node_id"] if method_target else None,
+            "error": detailed_error,
         }
     finally:
         if connected:
@@ -360,12 +425,15 @@ def render_metrics(snapshot: Optional[Dict[str, Any]]) -> None:
         return
 
     values = snapshot.get("values", {})
-    row1 = st.columns(5)
+    has_is_busy = "IsBusy" in values
+    row1 = st.columns(6 if has_is_busy else 5)
     row1[0].metric("State", str(values.get("State", "-")))
     row1[1].metric("Voltage (V)", format_number(values.get("Voltage")))
     row1[2].metric("Current (A)", format_number(values.get("Current")))
     row1[3].metric("Elapsed Time (s)", format_number(values.get("ElapsedTime")))
     row1[4].metric("Technique", str(values.get("Technique", "-")))
+    if has_is_busy:
+        row1[5].metric("Is Busy", str(values.get("IsBusy", "-")))
 
     row2 = st.columns(5)
     row2[0].metric("Data Rows", str(values.get("DataRows", "-")))
@@ -385,6 +453,23 @@ def render_latest_method_response() -> None:
         st.success(f"{result['method']} submitted at {result['timestamp']}")
     else:
         st.error(f"{result['method']} failed at {result['timestamp']}")
+
+    server_url = result.get("server_url")
+    function_set_node_id = result.get("function_set_node_id")
+    method_node_id = result.get("method_node_id")
+
+    if server_url:
+        st.write("Active Server")
+        st.text(str(server_url))
+
+    if function_set_node_id or method_node_id:
+        st.write("Resolved Target")
+        st.json(
+            {
+                "FunctionSet": function_set_node_id,
+                "Method": method_node_id,
+            }
+        )
 
     st.write("Payload")
     st.json(result.get("payload", {}))
@@ -588,7 +673,7 @@ def display_state_info(state_data: Dict[str, Any], chart_container: Any, data_co
                     for node in st.session_state.selected_nodes:
                         st.write(f"- {node['display_name']} ({node['browse_name']}): {node['node_id']}")
                 else:
-                    for label, node_id in DEFAULT_MONITOR_NODES.items():
+                    for label, node_id in resolve_monitor_nodes(st.session_state.active_server_url).items():
                         st.write(f"- {label}: {node_id}")
                 st.write(f"Last Read: {state_data['timestamp']}")
 
@@ -605,9 +690,10 @@ def render_monitor_tab(active_server_url: str) -> None:
     with st.expander("Browse OPC UA Object", expanded=True):
         browse_col1, browse_col2 = st.columns([3, 1])
         with browse_col1:
+            default_channel_node_id = get_biologic_channel_node_id(active_server_url) if active_server_url else DEFAULT_CHANNEL_NODE_ID
             object_node_id = st.text_input(
                 "Object Node ID",
-                value=DEFAULT_CHANNEL_NODE_ID,
+                value=default_channel_node_id,
                 help="Browse variables under a specific OPC UA object node.",
             )
 
@@ -767,7 +853,7 @@ def render_instrument_page(active_server_url: str) -> None:
             """
             ### Dashboard Overview
 
-            - Test Control: Start OCV, PEIS, GEIS, Charge, and Discharge methods from OPC UA buttons.
+            - Test Control: Start OCV, PEIS, GEIS, Charge, Discharge, and ForceStopChannel methods from OPC UA buttons.
             - Biologic Output: View the current live values published by the Biologic runtime.
             - History & Spectrum: Query the rolling GEIS history JSON and inspect returned spectra.
             - Custom Monitor: Keep the original free-form OPC UA browser and trend monitor.

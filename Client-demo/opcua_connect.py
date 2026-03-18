@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import streamlit as st
-from asyncua import Client
+from asyncua import Client, ua
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -17,11 +17,23 @@ DISCOVERY_REQUEST_TIMEOUT = 1.5
 LOCAL_DISCOVERY_TIMEOUT = 0.25
 LAN_DISCOVERY_TIMEOUT = 0.15
 LAN_SCAN_CONCURRENCY = 48
+OBJECTS_FOLDER_NODE_ID = "i=85"
+DEFAULT_FUNCTION_SET_NODE_ID = "ns=3;i=5009"
+DEFAULT_CHANNEL_NODE_ID = "ns=3;i=5002"
 
 DEFAULT_MONITOR_NODES: Dict[str, str] = {
     "Voltage": "ns=3;i=6026",
     "Current": "ns=3;i=6027",
     "ElapsedTime": "ns=3;i=6038",
+}
+
+DEFAULT_METHOD_NODE_IDS: Dict[str, str] = {
+    "RunOCV": "ns=3;i=7000",
+    "RunPEIS": "ns=3;i=7001",
+    "RunGEIS": "ns=3;i=7004",
+    "Charge": "ns=3;i=7005",
+    "Discharge": "ns=3;i=7009",
+    "ForceStopChannel": "ns=3;i=7010",
 }
 
 BIOLOGIC_OUTPUT_NODES: Dict[str, str] = {
@@ -40,6 +52,20 @@ BIOLOGIC_OUTPUT_NODES: Dict[str, str] = {
     "LatestEISPointCount": "ns=3;i=6104",
     "LatestEISRunId": "ns=3;i=6105",
 }
+
+BIOLOGIC_METHOD_NAMES = tuple(DEFAULT_METHOD_NODE_IDS.keys())
+
+
+def parse_node_id(node_id: Any) -> ua.NodeId:
+    if isinstance(node_id, ua.NodeId):
+        return node_id
+    if isinstance(node_id, str):
+        return ua.NodeId.from_string(node_id)
+    raise TypeError(f"Unsupported NodeId value: {node_id!r}")
+
+
+def get_opcua_node(client: Client, node_id: Any):
+    return client.get_node(parse_node_id(node_id))
 
 
 def ensure_session_state() -> None:
@@ -62,6 +88,7 @@ def ensure_session_state() -> None:
         "local_discovery_completed": False,
         "lan_scan_completed": False,
         "last_discovery_time": None,
+        "biologic_layout_cache": {},
     }
 
     for key, value in defaults.items():
@@ -363,9 +390,175 @@ def build_server_option_label(url: str) -> str:
     )
 
 
-def resolve_monitor_nodes() -> Dict[str, str]:
+def get_cached_biologic_layout(server_url: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not server_url:
+        return None
+    cache = st.session_state.get("biologic_layout_cache")
+    if not isinstance(cache, dict):
+        return None
+    return cache.get(server_url)
+
+
+async def _find_child_by_name(parent: Any, browse_name: str, node_class_name: Optional[str] = None) -> Optional[Any]:
+    for child in await parent.get_children():
+        try:
+            child_browse_name = await child.read_browse_name()
+            if str(child_browse_name.Name) != browse_name:
+                continue
+
+            if node_class_name is not None:
+                child_node_class = await child.read_node_class()
+                if str(getattr(child_node_class, "name", child_node_class)) != node_class_name:
+                    continue
+
+            return child
+        except Exception:
+            continue
+
+    return None
+
+
+async def _browse_children_by_class(parent: Any, node_class_name: str) -> Dict[str, str]:
+    nodes: Dict[str, str] = {}
+    for child in await parent.get_children():
+        try:
+            child_node_class = await child.read_node_class()
+            if str(getattr(child_node_class, "name", child_node_class)) != node_class_name:
+                continue
+
+            child_browse_name = await child.read_browse_name()
+            nodes[str(child_browse_name.Name)] = child.nodeid.to_string()
+        except Exception:
+            continue
+
+    return nodes
+
+
+async def discover_biologic_layout(server_url: str) -> Dict[str, Any]:
+    client = Client(url=server_url, timeout=DISCOVERY_REQUEST_TIMEOUT)
+    connected = False
+
+    try:
+        await client.connect()
+        connected = True
+
+        objects_node = get_opcua_node(client, OBJECTS_FOLDER_NODE_ID)
+        sequence_dispatcher = await _find_child_by_name(objects_node, "SequenceDispatcher", "Object")
+        if sequence_dispatcher is None:
+            return {"success": False, "error": "SequenceDispatcher was not found under Objects."}
+
+        function_set = await _find_child_by_name(sequence_dispatcher, "FunctionSet", "Object")
+        device_set = await _find_child_by_name(sequence_dispatcher, "DeviceSet", "Object")
+        ec_lab = await _find_child_by_name(device_set, "EC-LAB", "Object") if device_set is not None else None
+        channels = await _find_child_by_name(ec_lab, "Channels", "Object") if ec_lab is not None else None
+        channel0 = await _find_child_by_name(channels, "Channel0", "Object") if channels is not None else None
+
+        method_node_ids = await _browse_children_by_class(function_set, "Method") if function_set is not None else {}
+        output_nodes = await _browse_children_by_class(channel0, "Variable") if channel0 is not None else {}
+
+        if ec_lab is not None:
+            ec_lab_variables = await _browse_children_by_class(ec_lab, "Variable")
+            if "IsBusy" in ec_lab_variables:
+                output_nodes["IsBusy"] = ec_lab_variables["IsBusy"]
+
+        return {
+            "success": True,
+            "function_set_node_id": function_set.nodeid.to_string() if function_set is not None else None,
+            "channel_node_id": channel0.nodeid.to_string() if channel0 is not None else None,
+            "method_node_ids": method_node_ids,
+            "output_nodes": output_nodes,
+        }
+    except Exception as ex:
+        return {"success": False, "error": str(ex)}
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def get_biologic_layout(server_url: Optional[str], force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+    if not server_url:
+        return None
+
+    if "biologic_layout_cache" not in st.session_state:
+        st.session_state.biologic_layout_cache = {}
+
+    if not force_refresh:
+        cached = get_cached_biologic_layout(server_url)
+        if cached is not None:
+            return cached
+
+    discovered = asyncio.run(discover_biologic_layout(server_url))
+    st.session_state.biologic_layout_cache[server_url] = discovered
+    return discovered
+
+
+def get_biologic_output_nodes(server_url: Optional[str]) -> Dict[str, str]:
+    layout = get_biologic_layout(server_url)
+    if layout and layout.get("success"):
+        resolved_nodes = dict(BIOLOGIC_OUTPUT_NODES)
+        resolved_nodes.update(layout.get("output_nodes", {}))
+        return resolved_nodes
+    return BIOLOGIC_OUTPUT_NODES
+
+
+def resolve_biologic_method_target(method_name: str, layout: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, str]]:
+    function_set_node_id = DEFAULT_FUNCTION_SET_NODE_ID
+    method_node_id = DEFAULT_METHOD_NODE_IDS.get(method_name)
+
+    if layout and layout.get("success"):
+        function_set_node_id = layout.get("function_set_node_id") or function_set_node_id
+        method_node_id = layout.get("method_node_ids", {}).get(method_name, method_node_id)
+
+    if method_node_id is None:
+        return None
+
+    return {
+        "function_set_node_id": function_set_node_id,
+        "method_node_id": method_node_id,
+    }
+
+
+def get_biologic_method_node_ids(server_url: Optional[str], method_name: str) -> Optional[Dict[str, ua.NodeId]]:
+    target = get_biologic_method_target(server_url, method_name)
+    if target is None:
+        return None
+
+    return {
+        "function_set_node_id": parse_node_id(target["function_set_node_id"]),
+        "method_node_id": parse_node_id(target["method_node_id"]),
+    }
+
+
+def get_biologic_method_target(server_url: Optional[str], method_name: str) -> Optional[Dict[str, str]]:
+    layout = get_biologic_layout(server_url)
+    return resolve_biologic_method_target(method_name, layout)
+
+
+def get_biologic_channel_node_id(server_url: Optional[str]) -> str:
+    layout = get_biologic_layout(server_url)
+    if layout and layout.get("success"):
+        return layout.get("channel_node_id") or DEFAULT_CHANNEL_NODE_ID
+    return DEFAULT_CHANNEL_NODE_ID
+
+
+def get_biologic_channel_node(server_url: Optional[str]) -> ua.NodeId:
+    return parse_node_id(get_biologic_channel_node_id(server_url))
+
+
+def resolve_monitor_nodes(server_url: Optional[str] = None) -> Dict[str, str]:
     if st.session_state.selected_nodes:
         return {node["browse_name"]: node["node_id"] for node in st.session_state.selected_nodes}
+
+    layout = get_biologic_layout(server_url)
+    if layout and layout.get("success"):
+        resolved_nodes = dict(DEFAULT_MONITOR_NODES)
+        for key in DEFAULT_MONITOR_NODES:
+            resolved_nodes[key] = layout.get("output_nodes", {}).get(key, resolved_nodes[key])
+        return resolved_nodes
+
     return DEFAULT_MONITOR_NODES
 
 
@@ -384,7 +577,7 @@ async def read_node_values(server_url: str, nodes_config: Dict[str, str]) -> Dic
 
         for key, node_id in nodes_config.items():
             try:
-                node = client.get_node(node_id)
+                node = get_opcua_node(client, node_id)
                 result["values"][key] = await node.read_value()
             except Exception as ex:
                 result["values"][key] = None
@@ -412,8 +605,8 @@ def refresh_dashboard(server_url: Optional[str]) -> None:
         st.session_state.biologic_snapshot = None
         return
 
-    st.session_state.monitor_snapshot = asyncio.run(read_node_values(server_url, resolve_monitor_nodes()))
-    st.session_state.biologic_snapshot = asyncio.run(read_node_values(server_url, BIOLOGIC_OUTPUT_NODES))
+    st.session_state.monitor_snapshot = asyncio.run(read_node_values(server_url, resolve_monitor_nodes(server_url)))
+    st.session_state.biologic_snapshot = asyncio.run(read_node_values(server_url, get_biologic_output_nodes(server_url)))
 
 
 def run_local_discovery() -> int:
@@ -500,4 +693,5 @@ def disconnect_active_server() -> None:
     st.session_state.available_nodes = []
     st.session_state.selected_nodes = []
     st.session_state.data_history = {}
+    st.session_state.biologic_layout_cache = {}
     set_status("Disconnected client session.", "info")

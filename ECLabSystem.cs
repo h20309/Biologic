@@ -85,12 +85,15 @@ public class ECLabSystem : SequenceDispatcher
 
     // Register method parameter creators for OPC UA Methods
     // These enable dynamic technique execution via OPC UA with strongly-typed parameters
-    this.SequenceController.AddMethodParameterCreator("RunCV", (x) => JsonSerializer.Deserialize<MethodParameters.RunCV>(x ?? string.Empty)!);
-    this.SequenceController.AddMethodParameterCreator("RunOCV", (x) => JsonSerializer.Deserialize<MethodParameters.RunOCV>(x ?? string.Empty)!);
-    this.SequenceController.AddMethodParameterCreator("RunPEIS", (x) => JsonSerializer.Deserialize<MethodParameters.RunPEIS>(x ?? string.Empty)!);
-    this.SequenceController.AddMethodParameterCreator("RunGEIS", (x) => JsonSerializer.Deserialize<MethodParameters.RunGEIS>(x ?? string.Empty)!);
-    this.SequenceController.AddMethodParameterCreator("Charge", (x) => JsonSerializer.Deserialize<MethodParameters.Charge>(x ?? string.Empty)!);
-    this.SequenceController.AddMethodParameterCreator("Discharge", (x) => JsonSerializer.Deserialize<MethodParameters.Discharge>(x ?? string.Empty)!);
+    this.SequenceController.AddMethodParameterCreator("RunCV", (x) => DeserializeMethodParameter<MethodParameters.RunCV>(x)!);
+    this.SequenceController.AddMethodParameterCreator("RunOCV", (x) => DeserializeMethodParameter<MethodParameters.RunOCV>(x)!);
+    this.SequenceController.AddMethodParameterCreator("RunPEIS", (x) => DeserializeMethodParameter<MethodParameters.RunPEIS>(x)!);
+    this.SequenceController.AddMethodParameterCreator("RunGEIS", (x) => DeserializeMethodParameter<MethodParameters.RunGEIS>(x)!);
+    this.SequenceController.AddMethodParameterCreator("Charge", (x) => DeserializeMethodParameter<MethodParameters.Charge>(x)!);
+    this.SequenceController.AddMethodParameterCreator("Discharge", (x) => DeserializeMethodParameter<MethodParameters.Discharge>(x)!);
+    this.SequenceController.AddMethodParameterCreator(
+      "ForceStopChannel",
+      (x) => DeserializeMethodParameter<MethodParameters.ForceStopChannel>(x)!);
   }
 
   /// <summary>
@@ -122,5 +125,15 @@ public class ECLabSystem : SequenceDispatcher
       : string.Join(Path.PathSeparator, new[] { libraryDirectory, currentPath });
 
     Environment.SetEnvironmentVariable("PATH", updatedPath);
+  }
+
+  private static object? DeserializeMethodParameter<T>(string? json)
+  {
+    if (string.IsNullOrWhiteSpace(json))
+    {
+      return null;
+    }
+
+    return JsonSerializer.Deserialize<T>(json);
   }
 }
