@@ -91,17 +91,12 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   /// Start the automation system
   /// </summary>
   /// <remarks>
-  /// Polling is ensured after dispatcher startup because devices are opened during base.Start().
-  /// ConnectDeviceSequenceItem also re-checks polling so explicit connect requests remain idempotent.
+  /// Polling is not auto-started here.
+  /// Use ConnectDeviceSequenceItem to start polling after an explicit successful connection.
   /// </remarks>
   public new void Start()
   {
     base.Start();
-
-    if (this.IsPollingEnabled)
-    {
-      this.EnsurePollingForConnectedChannels();
-    }
   }
 
   /// <summary>
