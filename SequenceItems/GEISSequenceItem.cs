@@ -19,6 +19,8 @@ public class GEISSequenceItem : SequenceItem
   private const int DefaultAverageCount = 1;
   private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
   private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
+  private static readonly TimeSpan StopDrainTimeout = TimeSpan.FromSeconds(2);
+  private const int StopDrainEmptyReadThreshold = 3;
 
   private int _deviceId;
   private byte _channelIndex;
@@ -30,6 +32,7 @@ public class GEISSequenceItem : SequenceItem
   private string? _outputFile;
   private Dictionary<string, object>? _parameters;
   private ECLabDevice? _device;
+  private string? _parameterSummary;
 
   public override void Initialize(Sequence.StateContext context)
   {
@@ -92,14 +95,23 @@ public class GEISSequenceItem : SequenceItem
       finalFrequency: _finalFrequency_Hz,
       frequencyNumber: _frequencyPoints,
       iRange: SelectCurrentRange(Math.Abs(_dcCurrent_A) + Math.Abs(_acAmplitude_A)));
+    _parameterSummary = string.Join(
+      ", ",
+      _parameters
+        .OrderBy(entry => entry.Key, StringComparer.Ordinal)
+        .Select(entry => $"{entry.Key}={entry.Value}"));
   }
 
   public override Sequence.ResultTypes Execute(Sequence.StateContext context)
   {
+    ECLabAutomation? automation = context.SequenceDispatcher as ECLabAutomation;
+    bool restartPollingAfterGeis = false;
+
     try
     {
       Log.Information("Starting GEIS on channel {Channel}: {InitFreq}Hz to {FinalFreq}Hz, {Points} points",
         _channelIndex, _initialFrequency_Hz, _finalFrequency_Hz, _frequencyPoints);
+      Log.Information("Resolved GEIS parameters for channel {Channel}: {Parameters}", _channelIndex, _parameterSummary);
 
       if (_device == null || !_device.IsConnected || _device.DeviceId < 0)
       {
@@ -107,6 +119,15 @@ public class GEISSequenceItem : SequenceItem
       }
 
       this.EnsureChannelReadyForNewSequence();
+
+      if (automation?.IsPollingEnabled == true)
+      {
+        automation.StopPolling(_channelIndex);
+        restartPollingAfterGeis = true;
+        Log.Information(
+          "Temporarily stopped OPC UA polling for channel {Channel} while synchronously collecting GEIS BL_GetData results.",
+          _channelIndex);
+      }
 
       this.LoadGeisTechniqueWithFallbacks("geis.ecc");
 
@@ -120,6 +141,11 @@ public class GEISSequenceItem : SequenceItem
 
       if (spectrumPoints.Count == 0)
       {
+        Log.Warning(
+          "GEIS completed on channel {Channel} but no process 1 spectrum points were captured. WarmupPoints={WarmupPointCount}",
+          _channelIndex,
+          processZeroPoints.Count);
+
         context.ResultParameter = new
         {
           Success = false,
@@ -136,7 +162,7 @@ public class GEISSequenceItem : SequenceItem
         WriteSpectrumCsv(_outputFile!, spectrumPoints);
       }
 
-      context.ResultParameter = new
+      var fullResult = new
       {
         Success = true,
         Message = $"GEIS completed on channel {_channelIndex}",
@@ -150,6 +176,28 @@ public class GEISSequenceItem : SequenceItem
         Spectrum = spectrumPoints,
         WarmupPoints = processZeroPoints,
         OutputFile = _outputFile
+      };
+
+      if (automation != null)
+      {
+        string fullResultJson = SequenceDispatcher.Serialize(fullResult);
+        automation.PublishGeisResultPayload(context.ID, "RunGEIS", DateTime.UtcNow, fullResultJson);
+      }
+
+      context.ResultParameter = new
+      {
+        Success = true,
+        Message = $"GEIS completed on channel {_channelIndex}",
+        ChannelIndex = _channelIndex,
+        InitialFrequency_Hz = _initialFrequency_Hz,
+        FinalFrequency_Hz = _finalFrequency_Hz,
+        FrequencyPoints = _frequencyPoints,
+        DcCurrent_A = _dcCurrent_A,
+        AcAmplitude_A = _acAmplitude_A,
+        SpectrumPointCount = spectrumPoints.Count,
+        OutputFile = _outputFile,
+        ResultLocation = "LatestEISResultJson / LatestEISHistoryJson",
+        MethodResponseMode = "SummaryOnly"
       };
 
       return Sequence.ResultTypes.Next;
@@ -178,6 +226,14 @@ public class GEISSequenceItem : SequenceItem
 
       return Sequence.ResultTypes.Error;
     }
+    finally
+    {
+      if (restartPollingAfterGeis && automation?.IsPollingEnabled == true)
+      {
+        automation.StartPolling(_channelIndex);
+        Log.Information("Restarted OPC UA polling for channel {Channel} after GEIS collection finished.", _channelIndex);
+      }
+    }
   }
 
   public override void Deinitialize(Sequence.StateContext context)
@@ -194,20 +250,55 @@ public class GEISSequenceItem : SequenceItem
     var seenKeys = new HashSet<string>(StringComparer.Ordinal);
     DateTime deadline = DateTime.UtcNow + DefaultTimeout;
     bool stopObserved = false;
+    DateTime? stopDrainDeadline = null;
+    int emptyReadsAfterStop = 0;
+    string? lastFrameSignature = null;
 
     while (DateTime.UtcNow < deadline)
     {
       context.Token.ThrowIfCancellationRequested();
 
       var currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
-      stopObserved = (PROG_STATE)currentValues.State == PROG_STATE.STOP;
+      bool stopNow = (PROG_STATE)currentValues.State == PROG_STATE.STOP;
+      if (stopNow && !stopObserved)
+      {
+        stopObserved = true;
+        stopDrainDeadline = DateTime.UtcNow + StopDrainTimeout;
+        emptyReadsAfterStop = 0;
+        Log.Information(
+          "GEIS channel {Channel} entered STOP state. Continuing to drain BL_GetData for up to {DrainSeconds:F1}s.",
+          _channelIndex,
+          StopDrainTimeout.TotalSeconds);
+      }
 
       var (latestValues, dataInfo, dataBuffer) = ECLibApi.GetData(_deviceId, _channelIndex + 1);
+      string frameSignature = $"tech={dataInfo.TechniqueID},process={dataInfo.ProcessIndex},rows={dataInfo.NbRows},cols={dataInfo.NbCols},state={latestValues.State}";
+      if (dataInfo.NbRows > 0 && !StringComparer.Ordinal.Equals(lastFrameSignature, frameSignature))
+      {
+        Log.Information("GEIS data frame on channel {Channel}: {Frame}", _channelIndex, frameSignature);
+        lastFrameSignature = frameSignature;
+      }
+
       ParseDataBuffer(latestValues, dataInfo, dataBuffer, boardType, seenKeys, processZeroPoints, spectrumPoints);
 
       if (stopObserved)
       {
-        break;
+        if (dataInfo.NbRows <= 0)
+        {
+          emptyReadsAfterStop++;
+        }
+        else
+        {
+          emptyReadsAfterStop = 0;
+          stopDrainDeadline = DateTime.UtcNow + StopDrainTimeout;
+        }
+
+        if (stopDrainDeadline.HasValue &&
+            DateTime.UtcNow >= stopDrainDeadline.Value &&
+            emptyReadsAfterStop >= StopDrainEmptyReadThreshold)
+        {
+          break;
+        }
       }
 
       Thread.Sleep(DefaultPollInterval);
@@ -292,21 +383,44 @@ public class GEISSequenceItem : SequenceItem
         continue;
       }
 
-      if (dataInfo.NbCols < 15)
+      if (dataInfo.NbCols < 14)
       {
         continue;
       }
 
-      string spectrumKey = $"p1:{dataBuffer[offset + 1]}:{dataBuffer[offset + 14]}";
+      string spectrumKey = $"p1:{dataBuffer[offset + 0]}:{dataBuffer[offset + 13]}";
       if (!seenKeys.Add(spectrumKey))
       {
         continue;
       }
 
-      float frequency = ECLibApi.ConvertChannelNumericIntoSingle(dataBuffer[offset + 1], boardType);
-      float potential = ECLibApi.ConvertChannelNumericIntoSingle(dataBuffer[offset + 5], boardType);
-      float current = ECLibApi.ConvertChannelNumericIntoSingle(dataBuffer[offset + 6], boardType);
-      float time = ECLibApi.ConvertChannelNumericIntoSingle(dataBuffer[offset + 14], boardType);
+      float[] convertedColumns = new float[dataInfo.NbCols];
+      for (int columnIndex = 0; columnIndex < dataInfo.NbCols; columnIndex++)
+      {
+        if (dataInfo.NbCols == 15 && columnIndex == 14)
+        {
+          convertedColumns[columnIndex] = dataBuffer[offset + columnIndex];
+          continue;
+        }
+
+        convertedColumns[columnIndex] = ECLibApi.ConvertChannelNumericIntoSingle(dataBuffer[offset + columnIndex], boardType);
+      }
+
+      float frequency = convertedColumns[0];
+      float potentialAmplitude = convertedColumns[1];
+      float currentAmplitude = convertedColumns[2];
+      float phaseZwe = convertedColumns[3];
+      float potential = convertedColumns[4];
+      float current = convertedColumns[5];
+      float counterPotentialAmplitude = convertedColumns[7];
+      float counterCurrentAmplitude = convertedColumns[8];
+      float phaseZce = convertedColumns[9];
+      float counterPotential = convertedColumns[10];
+      float time = convertedColumns[13];
+      int? rangeCode = dataInfo.NbCols > 14 ? (int)dataBuffer[offset + 14] : null;
+      float? impedance = Math.Abs(currentAmplitude) > float.Epsilon
+        ? Math.Abs(potentialAmplitude / currentAmplitude)
+        : null;
 
       spectrumPoints.Add(new GeisSpectrumPoint
       {
@@ -314,7 +428,15 @@ public class GEISSequenceItem : SequenceItem
         Time_s = time,
         Potential_V = potential,
         Current_A = current,
-        Impedance_Ohm = Math.Abs(current) > float.Epsilon ? Math.Abs(potential / current) : null,
+        PotentialAmplitude_V = potentialAmplitude,
+        CurrentAmplitude_A = currentAmplitude,
+        CounterPotential_V = counterPotential,
+        CounterPotentialAmplitude_V = counterPotentialAmplitude,
+        CounterCurrentAmplitude_A = counterCurrentAmplitude,
+        PhaseZwe = phaseZwe,
+        PhaseZce = phaseZce,
+        RangeCode = rangeCode,
+        Impedance_Ohm = impedance,
         RawData = dataBuffer.Skip(offset).Take(dataInfo.NbCols).ToArray()
       });
     }
@@ -355,7 +477,7 @@ public class GEISSequenceItem : SequenceItem
 
     var lines = new List<string>
     {
-      "Frequency_Hz,Impedance_Ohm,Potential_V,Current_A,Time_s"
+      "Frequency_Hz,Impedance_Ohm,Potential_V,Current_A,PotentialAmplitude_V,CurrentAmplitude_A,CounterPotential_V,CounterPotentialAmplitude_V,CounterCurrentAmplitude_A,PhaseZwe,PhaseZce,Time_s,RangeCode"
     };
 
     lines.AddRange(spectrumPoints.Select(point => string.Join(",",
@@ -363,7 +485,15 @@ public class GEISSequenceItem : SequenceItem
       point.Impedance_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
       point.Potential_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.Current_A.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
-      point.Time_s.ToString("G9", System.Globalization.CultureInfo.InvariantCulture))));
+      point.PotentialAmplitude_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.CurrentAmplitude_A.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.CounterPotential_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.CounterPotentialAmplitude_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.CounterCurrentAmplitude_A.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.PhaseZwe.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.PhaseZce.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.Time_s.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.RangeCode?.ToString() ?? string.Empty)));
 
     File.WriteAllLines(resolvedPath, lines, Encoding.UTF8);
   }
@@ -371,11 +501,6 @@ public class GEISSequenceItem : SequenceItem
   private EccParam[] BuildEccParamArray(Dictionary<string, object> parameters)
   {
     var paramList = new List<EccParam>();
-
-    if (parameters.ContainsKey("vs_initializer"))
-    {
-      paramList.Add(ECLibApi.DefineBoolParameter("vs_initializer", Convert.ToBoolean(parameters["vs_initializer"]), 0));
-    }
 
     if (parameters.ContainsKey("Initial_Current_step"))
     {
@@ -387,19 +512,9 @@ public class GEISSequenceItem : SequenceItem
       paramList.Add(ECLibApi.DefineSingleParameter("Duration_step", Convert.ToSingle(parameters["Duration_step"]), 0));
     }
 
-    if (parameters.ContainsKey("Record EVERY_dT"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Record EVERY_dT", Convert.ToSingle(parameters["Record EVERY_dT"]), 0));
-    }
-
     if (parameters.ContainsKey("Record_every_dT"))
     {
       paramList.Add(ECLibApi.DefineSingleParameter("Record_every_dT", Convert.ToSingle(parameters["Record_every_dT"]), 0));
-    }
-
-    if (parameters.ContainsKey("Record EVERY_dE"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Record EVERY_dE", Convert.ToSingle(parameters["Record EVERY_dE"]), 0));
     }
 
     if (parameters.ContainsKey("Record_every_dE"))
@@ -412,19 +527,9 @@ public class GEISSequenceItem : SequenceItem
       paramList.Add(ECLibApi.DefineSingleParameter("Final_frequency", Convert.ToSingle(parameters["Final_frequency"]), 0));
     }
 
-    if (parameters.ContainsKey("Final_freqency"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Final_freqency", Convert.ToSingle(parameters["Final_freqency"]), 0));
-    }
-
     if (parameters.ContainsKey("Initial_frequency"))
     {
       paramList.Add(ECLibApi.DefineSingleParameter("Initial_frequency", Convert.ToSingle(parameters["Initial_frequency"]), 0));
-    }
-
-    if (parameters.ContainsKey("Initial_freqency"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Initial_freqency", Convert.ToSingle(parameters["Initial_freqency"]), 0));
     }
 
     if (parameters.ContainsKey("sweep"))
@@ -447,16 +552,6 @@ public class GEISSequenceItem : SequenceItem
       paramList.Add(ECLibApi.DefineIntParameter("Average_N_times", Convert.ToInt32(parameters["Average_N_times"]), 0));
     }
 
-    if (parameters.ContainsKey("Average_N(times"))
-    {
-      paramList.Add(ECLibApi.DefineIntParameter("Average_N(times", Convert.ToInt32(parameters["Average_N(times"]), 0));
-    }
-
-    if (parameters.ContainsKey("Average_N(times)"))
-    {
-      paramList.Add(ECLibApi.DefineIntParameter("Average_N(times)", Convert.ToInt32(parameters["Average_N(times)"]), 0));
-    }
-
     if (parameters.ContainsKey("Correction"))
     {
       paramList.Add(ECLibApi.DefineBoolParameter("Correction", Convert.ToBoolean(parameters["Correction"]), 0));
@@ -472,49 +567,9 @@ public class GEISSequenceItem : SequenceItem
       paramList.Add(ECLibApi.DefineIntParameter("I_Range", Convert.ToInt32(parameters["I_Range"]), 0));
     }
 
-    if (parameters.ContainsKey("E_Range"))
-    {
-      paramList.Add(ECLibApi.DefineIntParameter("E_Range", Convert.ToInt32(parameters["E_Range"]), 0));
-    }
-
     if (parameters.ContainsKey("vs_initial"))
     {
       paramList.Add(ECLibApi.DefineBoolParameter("vs_initial", Convert.ToBoolean(parameters["vs_initial"]), 0));
-    }
-
-    if (parameters.ContainsKey("Is_initial"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Is_initial", Convert.ToSingle(parameters["Is_initial"]), 0));
-    }
-
-    if (parameters.ContainsKey("Is_final"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Is_final", Convert.ToSingle(parameters["Is_final"]), 0));
-    }
-
-    if (parameters.ContainsKey("Duration"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Duration", Convert.ToSingle(parameters["Duration"]), 0));
-    }
-
-    if (parameters.ContainsKey("Ia"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("Ia", Convert.ToSingle(parameters["Ia"]), 0));
-    }
-
-    if (parameters.ContainsKey("freq_init"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("freq_init", Convert.ToSingle(parameters["freq_init"]), 0));
-    }
-
-    if (parameters.ContainsKey("freq_final"))
-    {
-      paramList.Add(ECLibApi.DefineSingleParameter("freq_final", Convert.ToSingle(parameters["freq_final"]), 0));
-    }
-
-    if (parameters.ContainsKey("Points_per_decade"))
-    {
-      paramList.Add(ECLibApi.DefineIntParameter("Points_per_decade", Convert.ToInt32(parameters["Points_per_decade"]), 0));
     }
 
     return paramList.ToArray();
@@ -584,23 +639,77 @@ public class GEISSequenceItem : SequenceItem
   {
     var parameters = new Dictionary<string, object>
     {
-      ["vs_initial"] = false,
+      ["vs_initial"] = GetConfiguredBoolean(false, "vs_initial"),
       ["Initial_Current_step"] = currentStep,
-      ["Duration_step"] = Convert.ToSingle(Properties?.GetValueOrDefault("Duration_step") ?? DefaultDurationStep),
-      ["Record_every_dT"] = Convert.ToSingle(Properties?.GetValueOrDefault("Record_every_dT") ?? DefaultRecordEveryDt),
-      ["Record_every_dE"] = Convert.ToSingle(Properties?.GetValueOrDefault("Record_every_dE") ?? DefaultRecordEveryDe),
+      ["Duration_step"] = GetConfiguredSingle(DefaultDurationStep, "Duration_step"),
+      ["Record_every_dT"] = GetConfiguredSingle(DefaultRecordEveryDt, "Record_every_dT"),
+      ["Record_every_dE"] = GetConfiguredSingle(DefaultRecordEveryDe, "Record_every_dE"),
       ["Final_frequency"] = finalFrequency,
       ["Initial_frequency"] = initialFrequency,
-      ["sweep"] = sweep,
+      ["sweep"] = GetConfiguredBoolean(sweep, "sweep"),
       ["Amplitude_Current"] = amplitudeCurrent,
       ["Frequency_number"] = frequencyNumber,
-      ["Average_N_times"] = Convert.ToInt32(Properties?.GetValueOrDefault("Average_N_times") ?? DefaultAverageCount),
-      ["Correction"] = Convert.ToBoolean(Properties?.GetValueOrDefault("Correction") ?? false),
-      ["Wait_for_steady"] = Convert.ToSingle(Properties?.GetValueOrDefault("Wait_for_steady") ?? DefaultWaitForSteady),
+      ["Average_N_times"] = GetConfiguredInt(DefaultAverageCount, "Average_N_times"),
+      ["Correction"] = GetConfiguredBoolean(false, "Correction"),
+      ["Wait_for_steady"] = GetConfiguredSingle(DefaultWaitForSteady, "Wait_for_steady"),
       ["I_Range"] = iRange
     };
 
     return parameters;
+  }
+
+  private float GetConfiguredSingle(float defaultValue, params string[] keys)
+  {
+    if (Properties == null)
+    {
+      return defaultValue;
+    }
+
+    foreach (string key in keys)
+    {
+      if (Properties.TryGetValue(key, out object? value) && value != null)
+      {
+        return Convert.ToSingle(value);
+      }
+    }
+
+    return defaultValue;
+  }
+
+  private int GetConfiguredInt(int defaultValue, params string[] keys)
+  {
+    if (Properties == null)
+    {
+      return defaultValue;
+    }
+
+    foreach (string key in keys)
+    {
+      if (Properties.TryGetValue(key, out object? value) && value != null)
+      {
+        return Convert.ToInt32(value);
+      }
+    }
+
+    return defaultValue;
+  }
+
+  private bool GetConfiguredBoolean(bool defaultValue, params string[] keys)
+  {
+    if (Properties == null)
+    {
+      return defaultValue;
+    }
+
+    foreach (string key in keys)
+    {
+      if (Properties.TryGetValue(key, out object? value) && value != null)
+      {
+        return Convert.ToBoolean(value);
+      }
+    }
+
+    return defaultValue;
   }
 
   private void EnsureChannelReadyForNewSequence()
@@ -621,7 +730,15 @@ public class GEISSequenceItem : SequenceItem
     public float Frequency_Hz { get; init; }
     public float Potential_V { get; init; }
     public float Current_A { get; init; }
+    public float PotentialAmplitude_V { get; init; }
+    public float CurrentAmplitude_A { get; init; }
+    public float CounterPotential_V { get; init; }
+    public float CounterPotentialAmplitude_V { get; init; }
+    public float CounterCurrentAmplitude_A { get; init; }
+    public float PhaseZwe { get; init; }
+    public float PhaseZce { get; init; }
     public float Time_s { get; init; }
+    public int? RangeCode { get; init; }
     public float? Impedance_Ohm { get; init; }
     public uint[] RawData { get; init; } = [];
   }

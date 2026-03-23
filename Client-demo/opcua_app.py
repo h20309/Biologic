@@ -148,6 +148,28 @@ def safe_parse_json(value: Any) -> Any:
     return None
 
 
+def pull_charge_snapshot(server_url: str, delay_seconds: float = 0.0) -> None:
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+
+    refresh_dashboard(server_url)
+    values = (st.session_state.biologic_snapshot or {}).get("values", {})
+    marker = values.get("LatestChargeUpdatedAt")
+    if marker:
+        st.session_state["last_charge_fetch_marker"] = str(marker)
+
+
+def pull_eis_snapshot(server_url: str, delay_seconds: float = 0.0) -> None:
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+
+    refresh_dashboard(server_url)
+    values = (st.session_state.biologic_snapshot or {}).get("values", {})
+    marker = values.get("LatestEISTimestamp") or values.get("LatestEISRunId")
+    if marker:
+        st.session_state["last_eis_fetch_marker"] = str(marker)
+
+
 def normalize_method_result(result: Any) -> Any:
     if isinstance(result, list) and len(result) == 1:
         return result[0]
@@ -531,7 +553,7 @@ def render_spectrum_view(result: Dict[str, Any]) -> None:
         st.json(result)
 
 
-def render_eis_panels(snapshot: Optional[Dict[str, Any]]) -> None:
+def render_eis_panels(snapshot: Optional[Dict[str, Any]], server_url: str) -> None:
     if not snapshot or not snapshot.get("connected"):
         st.info("No Biologic output snapshot available.")
         return
@@ -539,6 +561,19 @@ def render_eis_panels(snapshot: Optional[Dict[str, Any]]) -> None:
     values = snapshot.get("values", {})
     latest_result = safe_parse_json(values.get("LatestEISResultJson"))
     history = safe_parse_json(values.get("LatestEISHistoryJson"))
+
+    status_col1, status_col2, status_col3 = st.columns(3)
+    status_col1.metric("Latest EIS Status", str(values.get("LatestEISStatus", "-")))
+    status_col2.metric("Latest EIS Points", str(values.get("LatestEISPointCount", "-")))
+    status_col3.metric("Latest EIS Updated", str(values.get("LatestEISTimestamp", "-")))
+
+    action_col1, action_col2 = st.columns([1, 2])
+    with action_col1:
+        if st.button("Pull GEIS Data Now", key="pull_eis_data_now", use_container_width=True):
+            pull_eis_snapshot(server_url, delay_seconds=1.0)
+            st.rerun()
+    with action_col2:
+        st.caption("After GEIS reaches STOP, the client can wait briefly and pull the final OPC UA result snapshot once.")
 
     left_col, right_col = st.columns([1.2, 1.8])
 
@@ -587,7 +622,7 @@ def render_eis_panels(snapshot: Optional[Dict[str, Any]]) -> None:
         render_spectrum_view(selected_result)
 
 
-def render_charge_trend_panel(snapshot: Optional[Dict[str, Any]]) -> None:
+def render_charge_trend_panel(snapshot: Optional[Dict[str, Any]], server_url: str) -> None:
     if not snapshot or not snapshot.get("connected"):
         st.info("No Biologic output snapshot available.")
         return
@@ -601,6 +636,14 @@ def render_charge_trend_panel(snapshot: Optional[Dict[str, Any]]) -> None:
     status_col1.metric("Charge Status", charge_status)
     status_col2.metric("Charge Points", str(values.get("LatestChargePointCount", "-")))
     status_col3.metric("Charge Updated", str(values.get("LatestChargeUpdatedAt", "-")))
+
+    action_col1, action_col2 = st.columns([1, 2])
+    with action_col1:
+        if st.button("Pull Charge Data Now", key="pull_charge_data_now", use_container_width=True):
+            pull_charge_snapshot(server_url, delay_seconds=1.0)
+            st.rerun()
+    with action_col2:
+        st.caption("After Charge reaches Completed, the client can wait briefly and pull the final OPC UA snapshot once.")
 
     if csv_path:
         st.caption(f"CSV Path: {csv_path}")
@@ -853,6 +896,10 @@ def render_monitor_tab(active_server_url: str) -> None:
 
 
 def render_instrument_page(active_server_url: str) -> None:
+    st.session_state.setdefault("last_charge_fetch_marker", None)
+    st.session_state.setdefault("last_eis_fetch_marker", None)
+    st.session_state.setdefault("last_biologic_state", None)
+
     top_col1, top_col2, top_col3 = st.columns([1, 1.5, 2.5])
     with top_col1:
         auto_refresh = st.checkbox("Auto Refresh Dashboard", value=False)
@@ -867,6 +914,28 @@ def render_instrument_page(active_server_url: str) -> None:
 
     if auto_refresh:
         refresh_dashboard(active_server_url)
+
+    charge_values = (st.session_state.biologic_snapshot or {}).get("values", {})
+    charge_status = str(charge_values.get("LatestChargeStatus", ""))
+    charge_marker = charge_values.get("LatestChargeUpdatedAt")
+    last_charge_fetch_marker = st.session_state.get("last_charge_fetch_marker")
+    if charge_status == "Completed" and charge_marker and charge_marker != last_charge_fetch_marker:
+        pull_charge_snapshot(active_server_url, delay_seconds=1.0)
+
+    current_state = str(charge_values.get("State", ""))
+    previous_state = st.session_state.get("last_biologic_state")
+    last_method = (st.session_state.last_method_response or {}).get("method")
+    last_eis_fetch_marker = st.session_state.get("last_eis_fetch_marker")
+    current_eis_marker = charge_values.get("LatestEISTimestamp") or charge_values.get("LatestEISRunId")
+    if (
+        last_method == "RunGEIS"
+        and previous_state not in {None, "STOP"}
+        and current_state == "STOP"
+        and current_eis_marker != last_eis_fetch_marker
+    ):
+        pull_eis_snapshot(active_server_url, delay_seconds=1.0)
+
+    st.session_state["last_biologic_state"] = current_state
 
     control_tab, output_tab, history_tab, monitor_tab = st.tabs(
         ["Test Control", "Biologic Output", "History & Spectrum", "Custom Monitor"]
@@ -903,12 +972,12 @@ def render_instrument_page(active_server_url: str) -> None:
 
         st.markdown("---")
         st.subheader("Charge Trend")
-        render_charge_trend_panel(st.session_state.biologic_snapshot)
+        render_charge_trend_panel(st.session_state.biologic_snapshot, active_server_url)
 
     with history_tab:
         st.subheader("GEIS History Query")
         st.caption("Current long-lived OPC UA history is implemented for GEIS results.")
-        render_eis_panels(st.session_state.biologic_snapshot)
+        render_eis_panels(st.session_state.biologic_snapshot, active_server_url)
 
     with monitor_tab:
         render_monitor_tab(active_server_url)

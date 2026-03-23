@@ -21,6 +21,7 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   private const int MaxChargePointWindow = 1000;
   private readonly ConcurrentDictionary<byte, ChannelDataPoller> channelPollers = new();
   private readonly ConcurrentDictionary<byte, ChannelEisHistory> eisHistoryByChannel = new();
+  private readonly ConcurrentDictionary<uint, byte> directlyPublishedGeisRunIds = new();
   private readonly ConcurrentDictionary<byte, ChargeRunState> chargeRunsByChannel = new();
   private readonly CancellationTokenSource cancellationTokenSource = new();
   private readonly IReadOnlyDictionary<string, Action<SequenceResult>> resultPublishers;
@@ -336,6 +337,7 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     }
 
     string seriesJson;
+    bool publishCompletedSnapshot;
     lock (state.SyncRoot)
     {
       if (batch.DataInfo.NbRows > 0)
@@ -350,9 +352,80 @@ public class ECLabAutomation : ECLabSystem, IDisposable
       state.UpdatedAtUtc = batch.Timestamp.ToUniversalTime();
       state.Status = DetermineChargeStatus(state, batch.CurrentValues.State);
       seriesJson = SequenceDispatcher.Serialize(state.Points);
+      publishCompletedSnapshot = state.Status == "Completed" && !state.FinalSnapshotPublished;
+    }
+
+    if (publishCompletedSnapshot)
+    {
+      seriesJson = PublishCompletedChargeSnapshot(state);
     }
 
     this.UpdateLatestChargeNodes(batch.Channel, state, seriesJson);
+  }
+
+  private static string PublishCompletedChargeSnapshot(ChargeRunState state)
+  {
+    List<ChargeTimeSeriesPoint> finalPoints = LoadChargePointsFromCsv(state);
+
+    lock (state.SyncRoot)
+    {
+      state.FinalSnapshotPublished = true;
+      if (finalPoints.Count > 0)
+      {
+        state.TotalPointCount = Math.Max(state.TotalPointCount, finalPoints.Count);
+      }
+    }
+
+    Log.Information(
+      "Published final Charge snapshot for channel {Channel} from CSV. Csv={CsvPath}, Points={PointCount}",
+      state.ChannelIndex,
+      state.CsvPath,
+      finalPoints.Count);
+
+    return SequenceDispatcher.Serialize(finalPoints.Count > 0 ? finalPoints : state.Points);
+  }
+
+  private static List<ChargeTimeSeriesPoint> LoadChargePointsFromCsv(ChargeRunState state)
+  {
+    var points = new List<ChargeTimeSeriesPoint>();
+    if (string.IsNullOrWhiteSpace(state.CsvPath) || !File.Exists(state.CsvPath))
+    {
+      return points;
+    }
+
+    foreach (string line in File.ReadLines(state.CsvPath))
+    {
+      if (string.IsNullOrWhiteSpace(line) || line.StartsWith("Time(s)", StringComparison.OrdinalIgnoreCase))
+      {
+        continue;
+      }
+
+      string[] parts = line.Split(',', StringSplitOptions.TrimEntries);
+      if (parts.Length < 4)
+      {
+        continue;
+      }
+
+      if (!double.TryParse(parts[0], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out double timeSeconds) ||
+          !float.TryParse(parts[1], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out float ewe) ||
+          !float.TryParse(parts[2], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out float current) ||
+          !uint.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint cycle))
+      {
+        continue;
+      }
+
+      points.Add(new ChargeTimeSeriesPoint
+      {
+        ChannelIndex = state.ChannelIndex,
+        CapturedAtUtc = state.UpdatedAtUtc,
+        Time_s = timeSeconds,
+        Ewe_V = ewe,
+        I_A = current,
+        Cycle = cycle
+      });
+    }
+
+    return points;
   }
 
   private void UpdateLatestChargeNodes(byte channelIndex, ChargeRunState state, string seriesJson)
@@ -515,6 +588,12 @@ public class ECLabAutomation : ECLabSystem, IDisposable
       return;
     }
 
+    if (string.Equals(result.SequenceName, "RunGEIS", StringComparison.OrdinalIgnoreCase) &&
+        this.directlyPublishedGeisRunIds.TryRemove(result.ContextID, out _))
+    {
+      return;
+    }
+
     if (!this.resultPublishers.TryGetValue(result.SequenceName, out Action<SequenceResult>? publisher))
     {
       return;
@@ -530,24 +609,35 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     }
   }
 
+  public void PublishGeisResultPayload(uint runId, string sequenceName, DateTime completedAtUtc, string resultJson)
+  {
+    this.PublishGeisResultCore(runId, sequenceName, completedAtUtc, resultJson);
+    this.directlyPublishedGeisRunIds[runId] = 0;
+  }
+
   private void PublishGeisResult(SequenceResult result)
   {
-    using JsonDocument document = JsonDocument.Parse(result.Result!);
+    this.PublishGeisResultCore(result.ContextID, result.SequenceName, result.EndTime.ToUniversalTime(), result.Result!);
+  }
+
+  private void PublishGeisResultCore(uint runId, string sequenceName, DateTime completedAtUtc, string resultJson)
+  {
+    using JsonDocument document = JsonDocument.Parse(resultJson);
     JsonElement root = document.RootElement.Clone();
 
     if (!TryGetChannelIndex(root, out byte channelIndex))
     {
-      Log.Warning("Skipping GEIS result publication because ChannelIndex was missing. ContextId={ContextId}", result.ContextID);
+      Log.Warning("Skipping GEIS result publication because ChannelIndex was missing. ContextId={ContextId}", runId);
       return;
     }
 
     int spectrumPointCount = GetSpectrumPointCount(root);
     var snapshot = new EisResultSnapshot
     {
-      RunId = result.ContextID,
-      SequenceName = result.SequenceName,
+      RunId = runId,
+      SequenceName = sequenceName,
       ChannelIndex = channelIndex,
-      CompletedAtUtc = result.EndTime.ToUniversalTime(),
+      CompletedAtUtc = completedAtUtc,
       SpectrumPointCount = spectrumPointCount,
       Result = root,
     };
@@ -1020,6 +1110,8 @@ internal sealed class ChargeRunState
   public string CsvPath { get; init; } = string.Empty;
 
   public bool CsvInitialized { get; set; }
+
+  public bool FinalSnapshotPublished { get; set; }
 
   public int TotalPointCount { get; set; }
 
