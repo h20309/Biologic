@@ -52,7 +52,7 @@ METHOD_EXECUTION_RULES: Dict[str, Dict[str, Any]] = {
     "LoadTechnique": {"capability": "submission-only", "channel_field": None, "result_marker": None},
     "RunOCV": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
     "RunCV": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
-    "RunPEIS": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
+    "RunPEIS": {"capability": "state+result-tracked", "channel_field": "ChannelIndex", "result_marker": "eis"},
     "RunGEIS": {"capability": "state+result-tracked", "channel_field": "ChannelIndex", "result_marker": "eis"},
     "Charge": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": "charge"},
     "Discharge": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
@@ -107,6 +107,13 @@ METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
             "min": 0.000001,
             "step": 0.001,
         },
+        {"name": "Duration_step", "type": "float", "label": "Duration Step", "default": 0.0, "min": 0.0, "step": 0.1},
+        {"name": "Record_every_dT", "type": "float", "label": "Record Every dT", "default": 0.0, "min": 0.0, "step": 0.1},
+        {"name": "Record_every_dI", "type": "float", "label": "Record Every dI", "default": 0.0, "min": 0.0, "step": 0.0001},
+        {"name": "Average_N_times", "type": "int", "label": "Average N Times", "default": 3, "min": 1, "max": 100},
+        {"name": "Correction", "type": "bool", "label": "Correction", "default": True},
+        {"name": "Wait_for_steady", "type": "float", "label": "Wait For Steady", "default": 0.0, "min": 0.0, "step": 0.1},
+        {"name": "sweep", "type": "bool", "label": "Sweep", "default": False},
         {"name": "OutputFile", "type": "text", "label": "Output File", "default": ""},
     ],
     "RunGEIS": [
@@ -968,7 +975,7 @@ def render_eis_panels(snapshot: Optional[Dict[str, Any]], server_url: str) -> No
 
     action_col1, action_col2 = st.columns([1, 2])
     with action_col1:
-        if st.button("Pull GEIS Data Now", key="pull_eis_data_now", use_container_width=True):
+        if st.button("Pull EIS Data Now", key="pull_eis_data_now", use_container_width=True):
             pull_eis_snapshot(server_url, delay_seconds=1.0)
             st.rerun()
     with action_col2:
@@ -986,7 +993,7 @@ def render_eis_panels(snapshot: Optional[Dict[str, Any]], server_url: str) -> No
     with right_col:
         st.subheader("History Query")
         if not isinstance(history, list) or not history:
-            st.info("No EIS history has been published yet. Current long-lived history comes from GEIS runs.")
+            st.info("No EIS history has been published yet. Current long-lived history comes from EIS runs.")
             return
 
         summary_rows: List[Dict[str, Any]] = []
@@ -1373,8 +1380,8 @@ def render_instrument_page(active_server_url: str) -> None:
         render_charge_trend_panel(st.session_state.biologic_snapshot, active_server_url)
 
     with history_tab:
-        st.subheader("GEIS History Query")
-        st.caption("Current long-lived OPC UA history is implemented for GEIS results.")
+        st.subheader("EIS History Query")
+        st.caption("Current long-lived OPC UA history is implemented for GEIS and PEIS results.")
         render_eis_panels(st.session_state.biologic_snapshot, active_server_url)
 
     with monitor_tab:

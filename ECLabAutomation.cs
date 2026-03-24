@@ -21,7 +21,7 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   private const int MaxChargePointWindow = 1000;
   private readonly ConcurrentDictionary<byte, ChannelDataPoller> channelPollers = new();
   private readonly ConcurrentDictionary<byte, ChannelEisHistory> eisHistoryByChannel = new();
-  private readonly ConcurrentDictionary<uint, byte> directlyPublishedGeisRunIds = new();
+  private readonly ConcurrentDictionary<uint, byte> directlyPublishedEisRunIds = new();
   private readonly ConcurrentDictionary<byte, ChargeRunState> chargeRunsByChannel = new();
   private readonly CancellationTokenSource cancellationTokenSource = new();
   private readonly IReadOnlyDictionary<string, Action<SequenceResult>> resultPublishers;
@@ -33,7 +33,8 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   {
     this.resultPublishers = new Dictionary<string, Action<SequenceResult>>(StringComparer.OrdinalIgnoreCase)
     {
-      ["RunGEIS"] = this.PublishGeisResult,
+      ["RunGEIS"] = this.PublishEisResult,
+      ["RunPEIS"] = this.PublishEisResult,
     };
   }
 
@@ -588,8 +589,7 @@ public class ECLabAutomation : ECLabSystem, IDisposable
       return;
     }
 
-    if (string.Equals(result.SequenceName, "RunGEIS", StringComparison.OrdinalIgnoreCase) &&
-        this.directlyPublishedGeisRunIds.TryRemove(result.ContextID, out _))
+    if (this.directlyPublishedEisRunIds.TryRemove(result.ContextID, out _))
     {
       return;
     }
@@ -609,25 +609,25 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     }
   }
 
-  public void PublishGeisResultPayload(uint runId, string sequenceName, DateTime completedAtUtc, string resultJson)
+  public void PublishEisResultPayload(uint runId, string sequenceName, DateTime completedAtUtc, string resultJson)
   {
-    this.PublishGeisResultCore(runId, sequenceName, completedAtUtc, resultJson);
-    this.directlyPublishedGeisRunIds[runId] = 0;
+    this.PublishEisResultCore(runId, sequenceName, completedAtUtc, resultJson);
+    this.directlyPublishedEisRunIds[runId] = 0;
   }
 
-  private void PublishGeisResult(SequenceResult result)
+  private void PublishEisResult(SequenceResult result)
   {
-    this.PublishGeisResultCore(result.ContextID, result.SequenceName, result.EndTime.ToUniversalTime(), result.Result!);
+    this.PublishEisResultCore(result.ContextID, result.SequenceName, result.EndTime.ToUniversalTime(), result.Result!);
   }
 
-  private void PublishGeisResultCore(uint runId, string sequenceName, DateTime completedAtUtc, string resultJson)
+  private void PublishEisResultCore(uint runId, string sequenceName, DateTime completedAtUtc, string resultJson)
   {
     using JsonDocument document = JsonDocument.Parse(resultJson);
     JsonElement root = document.RootElement.Clone();
 
     if (!TryGetChannelIndex(root, out byte channelIndex))
     {
-      Log.Warning("Skipping GEIS result publication because ChannelIndex was missing. ContextId={ContextId}", runId);
+      Log.Warning("Skipping EIS result publication because ChannelIndex was missing. ContextId={ContextId}", runId);
       return;
     }
 
