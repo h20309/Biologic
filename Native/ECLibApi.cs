@@ -767,6 +767,32 @@ public class ECLibApi
     });
   }
 
+  /// <summary>
+  /// Calculate impedance magnitude from excitation and response amplitudes.
+  /// </summary>
+  public static float? CalculateImpedanceMagnitude(float excitationAmplitude, float responseAmplitude)
+  {
+    return Math.Abs(responseAmplitude) > float.Epsilon
+      ? Math.Abs(excitationAmplitude / responseAmplitude)
+      : null;
+  }
+
+  /// <summary>
+  /// Convert impedance magnitude and phase into Cartesian components.
+  /// Phase is expected in radians, matching the current GEIS/PEIS data layout.
+  /// </summary>
+  public static ImpedanceComponents? CalculateImpedanceComponents(float? magnitudeOhm, float phaseRadians)
+  {
+    if (!magnitudeOhm.HasValue)
+    {
+      return null;
+    }
+
+    float realOhm = magnitudeOhm.Value * MathF.Cos(phaseRadians);
+    float imaginaryOhm = magnitudeOhm.Value * MathF.Sin(phaseRadians);
+    return new ImpedanceComponents(realOhm, imaginaryOhm);
+  }
+
   #endregion
 
   #region Hardware Configuration
@@ -849,6 +875,11 @@ public class ECLibApi
   }
 
   #endregion
+}
+
+public readonly record struct ImpedanceComponents(float Real_Ohm, float Imaginary_Ohm)
+{
+  public float NyquistImaginary_Ohm => -this.Imaginary_Ohm;
 }
 
 /// <summary>

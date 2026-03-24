@@ -64,6 +64,13 @@ public class MethodParameters
   /// <param name="FrequencyPoints">Number of frequency points</param>
   /// <param name="DcCurrent_A">DC bias current in amperes</param>
   /// <param name="AcAmplitude_A">AC current amplitude in amperes</param>
+  /// <param name="Duration_step">Technique duration step</param>
+  /// <param name="Record_every_dT">Record interval by time</param>
+  /// <param name="Record_every_dE">Record interval by potential delta</param>
+  /// <param name="Average_N_times">Average count per point</param>
+  /// <param name="Correction">Enable correction</param>
+  /// <param name="Wait_for_steady">Wait time before point acquisition</param>
+  /// <param name="sweep">Frequency sweep direction</param>
   /// <param name="OutputFile">Output CSV file path (optional)</param>
   public record RunGEIS(
     int ChannelIndex,
@@ -72,6 +79,13 @@ public class MethodParameters
     int FrequencyPoints,
     float DcCurrent_A,
     float AcAmplitude_A,
+    float Duration_step = 0.0f,
+    float Record_every_dT = 0.0f,
+    float Record_every_dE = 0.0f,
+    int Average_N_times = 3,
+    bool Correction = true,
+    float Wait_for_steady = 0.0f,
+    bool sweep = false,
     string? OutputFile = null);
 
   /// <summary>

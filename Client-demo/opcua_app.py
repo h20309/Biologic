@@ -1,6 +1,8 @@
 import asyncio
+import math
 import json
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -13,9 +15,12 @@ from opcua_connect import (
     DEFAULT_CHANNEL_NODE_ID,
     DEFAULT_MONITOR_NODES,
     discover_biologic_layout,
-    get_biologic_method_node_ids,
+    get_available_biologic_methods,
     get_biologic_channel_node_id,
     get_opcua_node,
+    get_sequence_result_marker,
+    is_biologic_channel_active,
+    parse_node_id,
     refresh_dashboard,
     render_status,
     resolve_biologic_method_target,
@@ -25,11 +30,53 @@ from opcua_connect import (
 
 
 DISCOVERY_REQUEST_TIMEOUT = 1.5
+STALE_FINALIZING_TIMEOUT_SECONDS = 15.0
+TERMINAL_PHASES = {"completed", "failed", "warning", "canceled"}
+METHOD_DISPLAY_ORDER = [
+    "ConnectDevice",
+    "DisconnectDevice",
+    "LoadFirmware",
+    "LoadTechnique",
+    "RunOCV",
+    "RunCV",
+    "RunPEIS",
+    "RunGEIS",
+    "Charge",
+    "Discharge",
+    "ForceStopChannel",
+]
+METHOD_EXECUTION_RULES: Dict[str, Dict[str, Any]] = {
+    "ConnectDevice": {"capability": "submission-only", "channel_field": None, "result_marker": None},
+    "DisconnectDevice": {"capability": "submission-only", "channel_field": None, "result_marker": None},
+    "LoadFirmware": {"capability": "submission-only", "channel_field": None, "result_marker": None},
+    "LoadTechnique": {"capability": "submission-only", "channel_field": None, "result_marker": None},
+    "RunOCV": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
+    "RunCV": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
+    "RunPEIS": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
+    "RunGEIS": {"capability": "state+result-tracked", "channel_field": "ChannelIndex", "result_marker": "eis"},
+    "Charge": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": "charge"},
+    "Discharge": {"capability": "state-tracked", "channel_field": "ChannelIndex", "result_marker": None},
+    "ForceStopChannel": {"capability": "submission-only", "channel_field": "ChannelIndex", "result_marker": None},
+}
+METHOD_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
+    "ConnectDevice": [],
+    "DisconnectDevice": [],
+    "LoadFirmware": [],
+    "LoadTechnique": [],
     "RunOCV": [
         {"name": "ChannelIndex", "type": "int", "label": "Channel Index", "default": 0, "min": 0, "max": 15},
         {"name": "Duration_s", "type": "float", "label": "Duration (s)", "default": 60.0, "min": 0.1, "step": 1.0},
+        {"name": "OutputFile", "type": "text", "label": "Output File", "default": ""},
+    ],
+    "RunCV": [
+        {"name": "ChannelIndex", "type": "int", "label": "Channel Index", "default": 0, "min": 0, "max": 15},
+        {"name": "StartVoltage_V", "type": "float", "label": "Start Voltage (V)", "default": 0.0, "step": 0.01},
+        {"name": "Vertex1_V", "type": "float", "label": "Vertex 1 (V)", "default": 1.0, "step": 0.01},
+        {"name": "Vertex2_V", "type": "float", "label": "Vertex 2 (V)", "default": -1.0, "step": 0.01},
+        {"name": "ScanRate_V_s", "type": "float", "label": "Scan Rate (V/s)", "default": 0.1, "min": 0.0001, "step": 0.01},
+        {"name": "NCycles", "type": "int", "label": "Cycles", "default": 1, "min": 1, "max": 100},
         {"name": "OutputFile", "type": "text", "label": "Output File", "default": ""},
     ],
     "RunPEIS": [
@@ -90,6 +137,13 @@ METHOD_SCHEMAS: Dict[str, List[Dict[str, Any]]] = {
             "min": 0.0000001,
             "step": 0.0001,
         },
+        {"name": "Duration_step", "type": "float", "label": "Duration Step", "default": 0.0, "min": 0.0, "step": 0.1},
+        {"name": "Record_every_dT", "type": "float", "label": "Record Every dT", "default": 0.0, "min": 0.0, "step": 0.1},
+        {"name": "Record_every_dE", "type": "float", "label": "Record Every dE", "default": 0.0, "min": 0.0, "step": 0.0001},
+        {"name": "Average_N_times", "type": "int", "label": "Average N Times", "default": 3, "min": 1, "max": 100},
+        {"name": "Correction", "type": "bool", "label": "Correction", "default": True},
+        {"name": "Wait_for_steady", "type": "float", "label": "Wait For Steady", "default": 0.0, "min": 0.0, "step": 0.1},
+        {"name": "sweep", "type": "bool", "label": "Sweep", "default": False},
         {"name": "OutputFile", "type": "text", "label": "Output File", "default": ""},
     ],
     "Charge": [
@@ -176,6 +230,257 @@ def normalize_method_result(result: Any) -> Any:
     return result
 
 
+def get_method_rule(method_name: str) -> Dict[str, Any]:
+    return METHOD_EXECUTION_RULES.get(
+        method_name,
+        {"capability": "submission-only", "channel_field": "ChannelIndex", "result_marker": None},
+    )
+
+
+def get_method_display_order(method_name: str) -> int:
+    try:
+        return METHOD_DISPLAY_ORDER.index(method_name)
+    except ValueError:
+        return len(METHOD_DISPLAY_ORDER)
+
+
+def get_sorted_method_names(server_url: str) -> List[str]:
+    discovered = get_available_biologic_methods(server_url)
+    method_names = set(discovered) if discovered else set(METHOD_SCHEMAS.keys())
+    return sorted(method_names, key=lambda name: (get_method_display_order(name), name))
+
+
+def get_active_sequence_run() -> Optional[Dict[str, Any]]:
+    active_run = st.session_state.get("active_sequence_run")
+    return active_run if isinstance(active_run, dict) else None
+
+
+def has_pending_sequence_run() -> bool:
+    active_run = get_active_sequence_run()
+    if not active_run:
+        return False
+    return active_run.get("phase") not in TERMINAL_PHASES
+
+
+def get_snapshot_values() -> Dict[str, Any]:
+    return (st.session_state.biologic_snapshot or {}).get("values", {})
+
+
+def build_result_markers(values: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    return {
+        "eis": get_sequence_result_marker(values, "eis"),
+        "charge": get_sequence_result_marker(values, "charge"),
+    }
+
+
+def marker_changed(baseline: Optional[str], current: Optional[str]) -> bool:
+    return current not in (None, "") and current != baseline
+
+
+def sequence_result_marker_advanced(active_run: Optional[Dict[str, Any]]) -> bool:
+    if not active_run:
+        return False
+
+    rule = get_method_rule(active_run.get("method", ""))
+    result_marker = rule.get("result_marker")
+    if not result_marker:
+        return False
+
+    baseline_marker = (active_run.get("baseline_markers") or {}).get(result_marker)
+    current_marker = (active_run.get("current_markers") or {}).get(result_marker)
+    return marker_changed(baseline_marker, current_marker)
+
+
+def get_run_channel_index(method_name: str, payload: Dict[str, Any]) -> Optional[int]:
+    channel_field = get_method_rule(method_name).get("channel_field")
+    if not channel_field:
+        return None
+    channel_value = payload.get(channel_field)
+    return int(channel_value) if channel_value is not None else None
+
+
+def run_method_call(server_url: str, method_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return asyncio.run(call_biologic_method(server_url, method_name, payload))
+
+
+def start_method_submission(server_url: str, method_name: str, payload: Dict[str, Any]) -> Future:
+    return METHOD_CALL_EXECUTOR.submit(run_method_call, server_url, method_name, payload)
+
+
+def begin_sequence_run(server_url: str, method_name: str, payload: Dict[str, Any]) -> None:
+    values = get_snapshot_values()
+    future = start_method_submission(server_url, method_name, payload)
+    created_at = time.time()
+    st.session_state.last_method_response = None
+    st.session_state.active_sequence_run = {
+        "server_url": server_url,
+        "method": method_name,
+        "payload": payload,
+        "phase": "submitting",
+        "capability": get_method_rule(method_name).get("capability"),
+        "channel_index": get_run_channel_index(method_name, payload),
+        "baseline_markers": build_result_markers(values),
+        "current_markers": build_result_markers(values),
+        "run_started": False,
+        "stop_requested": False,
+        "submission_future": future,
+        "submission_result": None,
+        "created_at_epoch": created_at,
+        "submitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_phase_change_epoch": created_at,
+        "last_phase_change_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "final_status": None,
+        "history_recorded": False,
+    }
+
+
+def update_run_phase(active_run: Dict[str, Any], phase: str) -> None:
+    if active_run.get("phase") != phase:
+        active_run["phase"] = phase
+        active_run["last_phase_change_epoch"] = time.time()
+        active_run["last_phase_change_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_run_phase_age_seconds(active_run: Dict[str, Any]) -> float:
+    phase_epoch = active_run.get("last_phase_change_epoch")
+    if isinstance(phase_epoch, (int, float)):
+        return max(0.0, time.time() - float(phase_epoch))
+
+    timestamp_text = active_run.get("last_phase_change_at") or active_run.get("submitted_at")
+    if isinstance(timestamp_text, str):
+        try:
+            parsed = time.strptime(timestamp_text, "%Y-%m-%d %H:%M:%S")
+            return max(0.0, time.time() - time.mktime(parsed))
+        except ValueError:
+            return 0.0
+
+    return 0.0
+
+
+def is_submission_accepted(submission_result: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(submission_result, dict) or not submission_result.get("success"):
+        return False
+
+    parsed_response = submission_result.get("parsed_response")
+    if isinstance(parsed_response, dict):
+        message = parsed_response.get("Message") or parsed_response.get("message")
+        if isinstance(message, str) and message.strip().lower() == "accepted":
+            return True
+
+    raw_response = submission_result.get("raw_response")
+    return isinstance(raw_response, str) and raw_response.strip().lower() == "accepted"
+
+
+def finalize_sequence_run(active_run: Dict[str, Any], phase: str) -> None:
+    update_run_phase(active_run, phase)
+    active_run["final_status"] = phase
+    if not active_run.get("history_recorded"):
+        record_sequence_run_history(active_run)
+        active_run["history_recorded"] = True
+
+
+def update_active_sequence_run(server_url: str) -> None:
+    active_run = get_active_sequence_run()
+    if not active_run or active_run.get("server_url") != server_url:
+        return
+
+    values = get_snapshot_values()
+    active_run["current_markers"] = build_result_markers(values)
+    rule = get_method_rule(active_run["method"])
+    future = active_run.get("submission_future")
+
+    if isinstance(future, Future) and active_run.get("submission_result") is None and future.done():
+        try:
+            submission_result = future.result()
+        except Exception as ex:
+            submission_result = {
+                "success": False,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "server_url": server_url,
+                "method": active_run["method"],
+                "payload": active_run["payload"],
+                "error": str(ex),
+            }
+        active_run["submission_result"] = submission_result
+        st.session_state.last_method_response = submission_result
+        if rule.get("capability") == "submission-only":
+            record_command_history(submission_result)
+
+    submission_result = active_run.get("submission_result")
+    current_active = is_biologic_channel_active(values)
+    if current_active:
+        active_run["run_started"] = True
+
+    capability = rule.get("capability")
+    result_marker = rule.get("result_marker")
+    baseline_marker = active_run["baseline_markers"].get(result_marker) if result_marker else None
+    current_marker = active_run["current_markers"].get(result_marker) if result_marker else None
+    result_marker_advanced = marker_changed(baseline_marker, current_marker)
+
+    if capability == "submission-only":
+        if submission_result is None:
+            update_run_phase(active_run, "submitting")
+            return
+
+        if submission_result.get("success"):
+            finalize_sequence_run(active_run, "completed")
+        else:
+            finalize_sequence_run(active_run, "failed")
+        return
+
+    if current_active:
+        update_run_phase(active_run, "running")
+        return
+
+    if result_marker_advanced:
+        active_run["run_started"] = True
+        if submission_result is not None and not submission_result.get("success"):
+            finalize_sequence_run(active_run, "warning")
+        else:
+            finalize_sequence_run(active_run, "completed")
+        return
+
+    if not active_run.get("run_started"):
+        if submission_result is None:
+            update_run_phase(active_run, "submitting")
+            return
+
+        if submission_result.get("success"):
+            update_run_phase(active_run, "waiting_to_start")
+            return
+
+        finalize_sequence_run(active_run, "failed")
+        return
+
+    if active_run.get("stop_requested"):
+        finalize_sequence_run(active_run, "canceled")
+        return
+
+    if capability == "state+result-tracked" and result_marker:
+        phase_age_seconds = get_run_phase_age_seconds(active_run)
+        if (
+            is_submission_accepted(submission_result)
+            and phase_age_seconds >= STALE_FINALIZING_TIMEOUT_SECONDS
+            and current_marker in (None, "")
+        ):
+            stale_error = (
+                "The OPC UA method was accepted, but no long-lived result marker was published after the channel returned to STOP. "
+                "The previous execution state was cleared so a new run can be started."
+            )
+            if isinstance(submission_result, dict) and not submission_result.get("error"):
+                submission_result["error"] = stale_error
+            finalize_sequence_run(active_run, "warning")
+            return
+
+        update_run_phase(active_run, "finalizing")
+        return
+
+    if submission_result is not None and not submission_result.get("success"):
+        finalize_sequence_run(active_run, "warning")
+    else:
+        finalize_sequence_run(active_run, "completed")
+
+
 async def browse_opcua_object(server_url: str, object_node_id: str) -> Dict[str, Any]:
     client = Client(url=server_url, timeout=DISCOVERY_REQUEST_TIMEOUT)
     connected = False
@@ -245,16 +550,10 @@ async def call_biologic_method(server_url: str, method_name: str, payload: Dict[
                 "error": f"Method target could not be resolved for {method_name}.",
             }
 
-        resolved_node_ids = get_biologic_method_node_ids(server_url, method_name)
-        if resolved_node_ids is None:
-            return {
-                "success": False,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "server_url": server_url,
-                "method": method_name,
-                "payload": payload,
-                "error": f"Method NodeIds could not be resolved for {method_name}.",
-            }
+        resolved_node_ids = {
+            "function_set_node_id": parse_node_id(method_target["function_set_node_id"]),
+            "method_node_id": parse_node_id(method_target["method_node_id"]),
+        }
 
         function_set_node = get_opcua_node(client, resolved_node_ids["function_set_node_id"])
         method_node = get_opcua_node(client, resolved_node_ids["method_node_id"])
@@ -271,23 +570,26 @@ async def call_biologic_method(server_url: str, method_name: str, payload: Dict[
             input_arguments = []
 
         if isinstance(input_arguments, list) and len(input_arguments) == 0:
-            return {
-                "success": False,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "server_url": server_url,
-                "method": method_name,
-                "payload": payload,
-                "function_set_node_id": method_target["function_set_node_id"],
-                "method_node_id": method_target["method_node_id"],
-                "error": (
-                    f"The OPC UA server currently exposes {method_name} with 0 input arguments. "
-                    "This client sends one JSON string argument, so the live server model is out of sync with the Biologic runtime. "
-                    "Update the Biologic NodeSet XML, rebuild so the generated OPC UA sources refresh, and restart ORBIT."
-                ),
-            }
+            if payload:
+                return {
+                    "success": False,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "server_url": server_url,
+                    "method": method_name,
+                    "payload": payload,
+                    "function_set_node_id": method_target["function_set_node_id"],
+                    "method_node_id": method_target["method_node_id"],
+                    "error": (
+                        f"The OPC UA server currently exposes {method_name} with 0 input arguments. "
+                        "This client prepared a JSON payload, so the live server model is out of sync with the Biologic runtime. "
+                        "Update the Biologic NodeSet XML, rebuild so the generated OPC UA sources refresh, and restart ORBIT."
+                    ),
+                }
 
-        payload_text = json.dumps(payload)
-        raw_result = await function_set_node.call_method(resolved_node_ids["method_node_id"], payload_text)
+            raw_result = await function_set_node.call_method(resolved_node_ids["method_node_id"])
+        else:
+            payload_text = json.dumps(payload)
+            raw_result = await function_set_node.call_method(resolved_node_ids["method_node_id"], payload_text)
         normalized_result = normalize_method_result(raw_result)
 
         return {
@@ -408,6 +710,16 @@ def update_chart(values: Dict[str, Any], chart_container: Any) -> None:
 
 
 def summarize_method_result(method_result: Dict[str, Any]) -> str:
+    phase = method_result.get("phase")
+    if phase == "completed":
+        return method_result.get("summary", "Execution completed")
+    if phase == "warning":
+        return method_result.get("summary", "Execution completed with submission warning")
+    if phase == "canceled":
+        return method_result.get("summary", "Execution canceled")
+    if phase == "failed":
+        return method_result.get("summary", method_result.get("error", "Execution failed"))
+
     if not method_result.get("success"):
         return method_result.get("error", "Method call failed")
 
@@ -416,6 +728,34 @@ def summarize_method_result(method_result: Dict[str, Any]) -> str:
         return str(parsed_response.get("Message") or parsed_response.get("message") or "Method completed")
 
     return str(method_result.get("raw_response", "Method completed"))
+
+
+def record_sequence_run_history(active_run: Dict[str, Any]) -> None:
+    phase = active_run.get("final_status") or active_run.get("phase") or "unknown"
+    submission_result = active_run.get("submission_result") or {}
+    submission_error = submission_result.get("error")
+    success = phase in {"completed", "warning"}
+
+    if phase == "warning" and submission_error:
+        summary = f"Execution completed after submission warning: {submission_error}"
+    elif phase == "completed":
+        summary = "Execution completed"
+    elif phase == "canceled":
+        summary = "Execution canceled by ForceStopChannel"
+    else:
+        summary = submission_error or "Execution failed"
+
+    record_command_history(
+        {
+            "timestamp": active_run.get("last_phase_change_at") or active_run.get("submitted_at"),
+            "method": active_run.get("method"),
+            "phase": phase,
+            "success": success,
+            "payload": active_run.get("payload", {}),
+            "summary": summary,
+            "error": submission_error,
+        }
+    )
 
 
 def record_command_history(method_result: Dict[str, Any]) -> None:
@@ -466,19 +806,53 @@ def render_metrics(snapshot: Optional[Dict[str, Any]]) -> None:
 
 
 def render_latest_method_response() -> None:
+    active_run = get_active_sequence_run()
     result = st.session_state.last_method_response
-    if not result:
-        st.info("No method has been started from this client yet.")
+    if not active_run and not result:
+        st.info("No sequence has been started from this client yet.")
         return
 
-    if result.get("success"):
-        st.success(f"{result['method']} submitted at {result['timestamp']}")
-    else:
-        st.error(f"{result['method']} failed at {result['timestamp']}")
+    if active_run:
+        phase = active_run.get("phase", "unknown")
+        method_name = active_run.get("method", "Unknown")
+        submitted_at = active_run.get("submitted_at", "-")
+        marker_advanced = sequence_result_marker_advanced(active_run)
+        if phase == "completed":
+            st.success(f"{method_name} completed at {active_run.get('last_phase_change_at', submitted_at)}")
+        elif phase == "warning" and marker_advanced:
+            st.warning(
+                f"{method_name} completed at {active_run.get('last_phase_change_at', submitted_at)} with a submission transport warning"
+            )
+        elif phase == "warning":
+            st.warning(f"{method_name} warning at {active_run.get('last_phase_change_at', submitted_at)}")
+        elif phase in {"failed", "canceled"}:
+            st.error(f"{method_name} {phase} at {active_run.get('last_phase_change_at', submitted_at)}")
+        else:
+            st.info(f"{method_name} is {phase} since {submitted_at}")
 
-    server_url = result.get("server_url")
-    function_set_node_id = result.get("function_set_node_id")
-    method_node_id = result.get("method_node_id")
+        st.write("Execution")
+        st.json(
+            {
+                "Method": method_name,
+                "Phase": phase,
+                "ResultMarkerAdvanced": marker_advanced,
+                "Capability": active_run.get("capability"),
+                "ChannelIndex": active_run.get("channel_index"),
+                "SubmittedAt": submitted_at,
+                "LastPhaseChangeAt": active_run.get("last_phase_change_at"),
+                "RunStarted": active_run.get("run_started"),
+                "StopRequested": active_run.get("stop_requested"),
+                "BaselineMarkers": active_run.get("baseline_markers"),
+                "CurrentMarkers": active_run.get("current_markers"),
+            }
+        )
+
+        server_url = active_run.get("server_url")
+    else:
+        server_url = result.get("server_url")
+
+    function_set_node_id = result.get("function_set_node_id") if result else None
+    method_node_id = result.get("method_node_id") if result else None
 
     if server_url:
         st.write("Active Server")
@@ -494,19 +868,28 @@ def render_latest_method_response() -> None:
         )
 
     st.write("Payload")
-    st.json(result.get("payload", {}))
+    st.json((active_run or result).get("payload", {}))
 
-    if result.get("success"):
-        parsed_response = result.get("parsed_response")
-        if parsed_response is not None:
-            st.write("Response")
-            st.json(parsed_response)
+    if result:
+        if result.get("success"):
+            parsed_response = result.get("parsed_response")
+            if parsed_response is not None:
+                st.write("Submission Response")
+                st.json(parsed_response)
+            else:
+                st.write("Submission Raw Response")
+                st.text(str(result.get("raw_response", "")))
         else:
-            st.write("Raw Response")
-            st.text(str(result.get("raw_response", "")))
-    else:
-        st.write("Error")
-        st.text(result.get("error", "Unknown error"))
+            marker_advanced = sequence_result_marker_advanced(active_run)
+            if active_run and active_run.get("phase") in {"warning", "completed"} and marker_advanced:
+                st.write("Submission Transport Warning")
+                st.warning(
+                    "The sequence result was published successfully, but the synchronous OPC UA method response did not return to the client. "
+                    f"Transport detail: {result.get('error', 'Unknown error')}"
+                )
+            else:
+                st.write("Submission Error")
+                st.text(result.get("error", "Unknown error"))
 
 
 def render_command_history() -> None:
@@ -528,26 +911,42 @@ def render_spectrum_view(result: Dict[str, Any]) -> None:
     spectrum_df = pd.DataFrame(spectrum)
     st.dataframe(spectrum_df, width="stretch", hide_index=True)
 
-    if {"Frequency_Hz", "Impedance_Ohm"}.issubset(spectrum_df.columns):
+    if {"ImpedanceReal_Ohm", "NyquistImaginary_Ohm"}.issubset(spectrum_df.columns):
+        nyquist_df = spectrum_df.dropna(subset=["ImpedanceReal_Ohm", "NyquistImaginary_Ohm"]).copy()
+    elif {"Impedance_Ohm", "PhaseZwe"}.issubset(spectrum_df.columns):
+        nyquist_df = spectrum_df.dropna(subset=["Impedance_Ohm", "PhaseZwe"]).copy()
+        nyquist_df["ImpedanceReal_Ohm"] = nyquist_df["Impedance_Ohm"] * nyquist_df["PhaseZwe"].map(math.cos)
+        nyquist_df["NyquistImaginary_Ohm"] = -nyquist_df["Impedance_Ohm"] * nyquist_df["PhaseZwe"].map(math.sin)
+    else:
+        nyquist_df = pd.DataFrame()
+
+    if not nyquist_df.empty:
+        if "Frequency_Hz" in nyquist_df.columns:
+            nyquist_df = nyquist_df.sort_values(by="Frequency_Hz", ascending=False)
+
         chart = go.Figure()
         chart.add_trace(
             go.Scatter(
-                x=spectrum_df["Frequency_Hz"],
-                y=spectrum_df["Impedance_Ohm"],
+                x=nyquist_df["ImpedanceReal_Ohm"],
+                y=nyquist_df["NyquistImaginary_Ohm"],
                 mode="lines+markers",
-                name="|Z|",
+                name="Nyquist",
                 line=dict(color="#1f77b4", width=2),
+                customdata=nyquist_df.get("Frequency_Hz"),
+                hovertemplate="Re(Z): %{x:.6g} Ohm<br>-Im(Z): %{y:.6g} Ohm<br>f: %{customdata:.6g} Hz<extra></extra>",
             )
         )
         chart.update_layout(
-            title="EIS Magnitude",
-            xaxis=dict(title="Frequency (Hz)", type="log", autorange="reversed"),
-            yaxis=dict(title="Impedance (Ohm)"),
-            hovermode="x unified",
+            title="Nyquist Plot",
+            xaxis=dict(title="Re(Z) (Ohm)"),
+            yaxis=dict(title="-Im(Z) (Ohm)", scaleanchor="x", scaleratio=1),
+            hovermode="closest",
             height=420,
             margin=dict(l=60, r=30, t=60, b=60),
         )
         st.plotly_chart(chart, width="stretch")
+    else:
+        st.info("Spectrum data does not contain enough impedance fields to render a Nyquist plot.")
 
     with st.expander("Raw Result JSON", expanded=False):
         st.json(result)
@@ -693,7 +1092,7 @@ def render_charge_trend_panel(snapshot: Optional[Dict[str, Any]], server_url: st
 
 def build_payload_from_form(method_name: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
-    schema = METHOD_SCHEMAS[method_name]
+    schema = METHOD_SCHEMAS.get(method_name, [])
     columns = st.columns(2)
 
     for index, field in enumerate(schema):
@@ -724,6 +1123,12 @@ def build_payload_from_form(method_name: str) -> Dict[str, Any]:
                         key=field_key,
                     )
                 )
+            elif field_type == "bool":
+                payload[field["name"]] = st.checkbox(
+                    field["label"],
+                    value=bool(field.get("default", False)),
+                    key=field_key,
+                )
             else:
                 payload[field["name"]] = st.text_input(
                     field["label"],
@@ -735,18 +1140,33 @@ def build_payload_from_form(method_name: str) -> Dict[str, Any]:
 
 
 def render_method_form(method_name: str, server_url: str) -> None:
+    active_run = get_active_sequence_run()
+    pending_run = has_pending_sequence_run()
+    submit_disabled = pending_run and method_name != "ForceStopChannel"
+
     with st.form(f"form_{method_name}"):
         payload = build_payload_from_form(method_name)
-        submitted = st.form_submit_button(f"Start {method_name}", use_container_width=True)
+        submitted = st.form_submit_button(f"Start {method_name}", use_container_width=True, disabled=submit_disabled)
+
+    if submit_disabled and active_run:
+        st.caption(f"{active_run['method']} is currently {active_run['phase']}. Use ForceStopChannel to interrupt it before starting a new run.")
 
     if submitted:
         normalized_payload = {
             key: normalize_optional_text(value) if isinstance(value, str) else value
             for key, value in payload.items()
         }
-        result = asyncio.run(call_biologic_method(server_url, method_name, normalized_payload))
-        st.session_state.last_method_response = result
-        record_command_history(result)
+
+        if method_name == "ForceStopChannel":
+            result = asyncio.run(call_biologic_method(server_url, method_name, normalized_payload))
+            st.session_state.last_method_response = result
+            record_command_history(result)
+            if result.get("success") and active_run:
+                active_run["stop_requested"] = True
+                update_run_phase(active_run, "canceled")
+        else:
+            begin_sequence_run(server_url, method_name, normalized_payload)
+
         refresh_dashboard(server_url)
         st.rerun()
 
@@ -896,10 +1316,6 @@ def render_monitor_tab(active_server_url: str) -> None:
 
 
 def render_instrument_page(active_server_url: str) -> None:
-    st.session_state.setdefault("last_charge_fetch_marker", None)
-    st.session_state.setdefault("last_eis_fetch_marker", None)
-    st.session_state.setdefault("last_biologic_state", None)
-
     top_col1, top_col2, top_col3 = st.columns([1, 1.5, 2.5])
     with top_col1:
         auto_refresh = st.checkbox("Auto Refresh Dashboard", value=False)
@@ -909,33 +1325,15 @@ def render_instrument_page(active_server_url: str) -> None:
         if st.button("Refresh Dashboard Now", use_container_width=True):
             refresh_dashboard(active_server_url)
 
+    active_run_pending = has_pending_sequence_run()
     if st.session_state.monitor_snapshot is None or st.session_state.biologic_snapshot is None:
         refresh_dashboard(active_server_url)
-
-    if auto_refresh:
+    elif auto_refresh or active_run_pending:
         refresh_dashboard(active_server_url)
 
-    charge_values = (st.session_state.biologic_snapshot or {}).get("values", {})
-    charge_status = str(charge_values.get("LatestChargeStatus", ""))
-    charge_marker = charge_values.get("LatestChargeUpdatedAt")
-    last_charge_fetch_marker = st.session_state.get("last_charge_fetch_marker")
-    if charge_status == "Completed" and charge_marker and charge_marker != last_charge_fetch_marker:
-        pull_charge_snapshot(active_server_url, delay_seconds=1.0)
+    update_active_sequence_run(active_server_url)
 
-    current_state = str(charge_values.get("State", ""))
-    previous_state = st.session_state.get("last_biologic_state")
-    last_method = (st.session_state.last_method_response or {}).get("method")
-    last_eis_fetch_marker = st.session_state.get("last_eis_fetch_marker")
-    current_eis_marker = charge_values.get("LatestEISTimestamp") or charge_values.get("LatestEISRunId")
-    if (
-        last_method == "RunGEIS"
-        and previous_state not in {None, "STOP"}
-        and current_state == "STOP"
-        and current_eis_marker != last_eis_fetch_marker
-    ):
-        pull_eis_snapshot(active_server_url, delay_seconds=1.0)
-
-    st.session_state["last_biologic_state"] = current_state
+    method_names = get_sorted_method_names(active_server_url)
 
     control_tab, output_tab, history_tab, monitor_tab = st.tabs(
         ["Test Control", "Biologic Output", "History & Spectrum", "Custom Monitor"]
@@ -944,14 +1342,14 @@ def render_instrument_page(active_server_url: str) -> None:
     with control_tab:
         st.subheader("Start Tests")
         st.caption("Available buttons are driven by the Biologic OPC UA FunctionSet methods.")
-        method_tabs = st.tabs(list(METHOD_SCHEMAS.keys()))
+        method_tabs = st.tabs(method_names)
 
-        for tab, method_name in zip(method_tabs, METHOD_SCHEMAS.keys()):
+        for tab, method_name in zip(method_tabs, method_names):
             with tab:
                 render_method_form(method_name, active_server_url)
 
         st.markdown("---")
-        st.subheader("Last Method Response")
+        st.subheader("Execution Status")
         render_latest_method_response()
 
         st.markdown("---")
@@ -1002,6 +1400,6 @@ def render_instrument_page(active_server_url: str) -> None:
 
     render_status()
 
-    if auto_refresh:
+    if auto_refresh or active_run_pending:
         time.sleep(refresh_interval)
         st.rerun()

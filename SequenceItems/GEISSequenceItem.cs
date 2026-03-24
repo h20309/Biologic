@@ -14,12 +14,12 @@ public class GEISSequenceItem : SequenceItem
 {
   private const float DefaultRecordEveryDt = 0.0f;
   private const float DefaultRecordEveryDe = 0.0f;
-  private const float DefaultWaitForSteady = 0.0f;
+  private const float DefaultWaitForSteady = 5.0f;
   private const float DefaultDurationStep = 1.0f;
   private const int DefaultAverageCount = 1;
   private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromMilliseconds(200);
-  private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
-  private static readonly TimeSpan StopDrainTimeout = TimeSpan.FromSeconds(2);
+  private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(10);
+  private static readonly TimeSpan StopDrainTimeout = TimeSpan.FromSeconds(10);
   private const int StopDrainEmptyReadThreshold = 3;
 
   private int _deviceId;
@@ -47,6 +47,13 @@ public class GEISSequenceItem : SequenceItem
       _frequencyPoints = methodParameter.FrequencyPoints;
       _dcCurrent_A = methodParameter.DcCurrent_A;
       _acAmplitude_A = methodParameter.AcAmplitude_A;
+      Properties["Duration_step"] = methodParameter.Duration_step;
+      Properties["Record_every_dT"] = methodParameter.Record_every_dT;
+      Properties["Record_every_dE"] = methodParameter.Record_every_dE;
+      Properties["Average_N_times"] = methodParameter.Average_N_times;
+      Properties["Correction"] = methodParameter.Correction;
+      Properties["Wait_for_steady"] = methodParameter.Wait_for_steady;
+      Properties["sweep"] = methodParameter.sweep;
       _outputFile = methodParameter.OutputFile;
     }
     else
@@ -118,8 +125,6 @@ public class GEISSequenceItem : SequenceItem
         throw new InvalidOperationException("Device is not connected");
       }
 
-      this.EnsureChannelReadyForNewSequence();
-
       if (automation?.IsPollingEnabled == true)
       {
         automation.StopPolling(_channelIndex);
@@ -128,6 +133,9 @@ public class GEISSequenceItem : SequenceItem
           "Temporarily stopped OPC UA polling for channel {Channel} while synchronously collecting GEIS BL_GetData results.",
           _channelIndex);
       }
+
+          this.ResetChannelBeforeGeis();
+          this.EnsureChannelReadyForNewSequence();
 
       this.LoadGeisTechniqueWithFallbacks("geis.ecc");
 
@@ -248,6 +256,7 @@ public class GEISSequenceItem : SequenceItem
   {
     var spectrumPoints = new List<GeisSpectrumPoint>();
     var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+    var collectionDiagnostics = new GeisCollectionDiagnostics();
     DateTime deadline = DateTime.UtcNow + DefaultTimeout;
     bool stopObserved = false;
     DateTime? stopDrainDeadline = null;
@@ -279,7 +288,7 @@ public class GEISSequenceItem : SequenceItem
         lastFrameSignature = frameSignature;
       }
 
-      ParseDataBuffer(latestValues, dataInfo, dataBuffer, boardType, seenKeys, processZeroPoints, spectrumPoints);
+      ParseDataBuffer(latestValues, dataInfo, dataBuffer, boardType, seenKeys, processZeroPoints, spectrumPoints, collectionDiagnostics);
 
       if (stopObserved)
       {
@@ -309,7 +318,35 @@ public class GEISSequenceItem : SequenceItem
       throw new TimeoutException($"GEIS did not finish within {DefaultTimeout.TotalMinutes:F1} minutes on channel {_channelIndex}.");
     }
 
+    Log.Information(
+      "GEIS collection summary on channel {Channel}: Process0Accepted={Process0Accepted}, Process1RowsSeen={Process1RowsSeen}, Process1Accepted={Process1Accepted}, Process1Duplicates={Process1Duplicates}, Process1ShortRows={Process1ShortRows}, FinalSpectrumPoints={FinalSpectrumPoints}",
+      _channelIndex,
+      collectionDiagnostics.ProcessZeroAccepted,
+      collectionDiagnostics.ProcessOneRowsSeen,
+      collectionDiagnostics.ProcessOneAccepted,
+      collectionDiagnostics.ProcessOneDuplicates,
+      collectionDiagnostics.ProcessOneShortRows,
+      spectrumPoints.Count);
+
+    Log.Information(
+      "GEIS process 1 accepted frequencies on channel {Channel}: Count={Count}, FrequenciesHz=[{Frequencies}]",
+      _channelIndex,
+      collectionDiagnostics.ProcessOneAcceptedFrequencies.Count,
+      FormatFrequencyList(collectionDiagnostics.ProcessOneAcceptedFrequencies));
+
     return spectrumPoints;
+  }
+
+  private static string FormatFrequencyList(IReadOnlyList<float> frequencies)
+  {
+    if (frequencies.Count == 0)
+    {
+      return "<none>";
+    }
+
+    return string.Join(
+      ", ",
+      frequencies.Select(frequency => frequency.ToString("G9", System.Globalization.CultureInfo.InvariantCulture)));
   }
 
   private void ParseDataBuffer(
@@ -319,7 +356,8 @@ public class GEISSequenceItem : SequenceItem
     uint boardType,
     HashSet<string> seenKeys,
     List<object> processZeroPoints,
-    List<GeisSpectrumPoint> spectrumPoints)
+    List<GeisSpectrumPoint> spectrumPoints,
+    GeisCollectionDiagnostics collectionDiagnostics)
   {
     if (dataInfo.NbRows <= 0 || dataInfo.NbCols <= 0)
     {
@@ -374,6 +412,7 @@ public class GEISSequenceItem : SequenceItem
           Potential_V = ewe,
           Current_A = processZeroCurrent
         });
+        collectionDiagnostics.ProcessZeroAccepted++;
 
         continue;
       }
@@ -383,14 +422,18 @@ public class GEISSequenceItem : SequenceItem
         continue;
       }
 
+      collectionDiagnostics.ProcessOneRowsSeen++;
+
       if (dataInfo.NbCols < 14)
       {
+        collectionDiagnostics.ProcessOneShortRows++;
         continue;
       }
 
       string spectrumKey = $"p1:{dataBuffer[offset + 0]}:{dataBuffer[offset + 13]}";
       if (!seenKeys.Add(spectrumKey))
       {
+        collectionDiagnostics.ProcessOneDuplicates++;
         continue;
       }
 
@@ -418,9 +461,10 @@ public class GEISSequenceItem : SequenceItem
       float counterPotential = convertedColumns[10];
       float time = convertedColumns[13];
       int? rangeCode = dataInfo.NbCols > 14 ? (int)dataBuffer[offset + 14] : null;
-      float? impedance = Math.Abs(currentAmplitude) > float.Epsilon
-        ? Math.Abs(potentialAmplitude / currentAmplitude)
-        : null;
+      float? impedance = ECLibApi.CalculateImpedanceMagnitude(potentialAmplitude, currentAmplitude);
+      ImpedanceComponents? workingImpedanceComponents = ECLibApi.CalculateImpedanceComponents(impedance, phaseZwe);
+      float? counterImpedance = ECLibApi.CalculateImpedanceMagnitude(counterPotentialAmplitude, counterCurrentAmplitude);
+      ImpedanceComponents? counterImpedanceComponents = ECLibApi.CalculateImpedanceComponents(counterImpedance, phaseZce);
 
       spectrumPoints.Add(new GeisSpectrumPoint
       {
@@ -437,8 +481,16 @@ public class GEISSequenceItem : SequenceItem
         PhaseZce = phaseZce,
         RangeCode = rangeCode,
         Impedance_Ohm = impedance,
+        ImpedanceReal_Ohm = workingImpedanceComponents?.Real_Ohm,
+        ImpedanceImaginary_Ohm = workingImpedanceComponents?.Imaginary_Ohm,
+        NyquistImaginary_Ohm = workingImpedanceComponents?.NyquistImaginary_Ohm,
+        CounterImpedance_Ohm = counterImpedance,
+        CounterImpedanceReal_Ohm = counterImpedanceComponents?.Real_Ohm,
+        CounterImpedanceImaginary_Ohm = counterImpedanceComponents?.Imaginary_Ohm,
         RawData = dataBuffer.Skip(offset).Take(dataInfo.NbCols).ToArray()
       });
+      collectionDiagnostics.ProcessOneAccepted++;
+      collectionDiagnostics.ProcessOneAcceptedFrequencies.Add(frequency);
     }
   }
 
@@ -477,12 +529,15 @@ public class GEISSequenceItem : SequenceItem
 
     var lines = new List<string>
     {
-      "Frequency_Hz,Impedance_Ohm,Potential_V,Current_A,PotentialAmplitude_V,CurrentAmplitude_A,CounterPotential_V,CounterPotentialAmplitude_V,CounterCurrentAmplitude_A,PhaseZwe,PhaseZce,Time_s,RangeCode"
+      "Frequency_Hz,Impedance_Ohm,ImpedanceReal_Ohm,ImpedanceImaginary_Ohm,NyquistImaginary_Ohm,Potential_V,Current_A,PotentialAmplitude_V,CurrentAmplitude_A,CounterPotential_V,CounterPotentialAmplitude_V,CounterCurrentAmplitude_A,CounterImpedance_Ohm,CounterImpedanceReal_Ohm,CounterImpedanceImaginary_Ohm,PhaseZwe,PhaseZce,Time_s,RangeCode"
     };
 
     lines.AddRange(spectrumPoints.Select(point => string.Join(",",
       point.Frequency_Hz.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.Impedance_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+      point.ImpedanceReal_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+      point.ImpedanceImaginary_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+      point.NyquistImaginary_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
       point.Potential_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.Current_A.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.PotentialAmplitude_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
@@ -490,6 +545,9 @@ public class GEISSequenceItem : SequenceItem
       point.CounterPotential_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.CounterPotentialAmplitude_V.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.CounterCurrentAmplitude_A.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
+      point.CounterImpedance_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+      point.CounterImpedanceReal_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+      point.CounterImpedanceImaginary_Ohm?.ToString("G9", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
       point.PhaseZwe.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.PhaseZce.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
       point.Time_s.ToString("G9", System.Globalization.CultureInfo.InvariantCulture),
@@ -712,6 +770,27 @@ public class GEISSequenceItem : SequenceItem
     return defaultValue;
   }
 
+  private void ResetChannelBeforeGeis()
+  {
+    if (_device == null)
+    {
+      throw new InvalidOperationException("GEIS device context is not available.");
+    }
+
+    Log.Information(
+      "Performing pre-GEIS channel reset on channel {Channel} with forced firmware reload.",
+      _channelIndex);
+
+    bool resetSucceeded = _device.ResetChannelTechniqueState(_channelIndex, forceFirmwareReload: true);
+    if (!resetSucceeded)
+    {
+      throw new InvalidOperationException(
+        $"Pre-GEIS channel reset failed on channel {_channelIndex}. Check firmware reload and channel diagnostics.");
+    }
+
+    Log.Information("Pre-GEIS channel reset completed on channel {Channel}.", _channelIndex);
+  }
+
   private void EnsureChannelReadyForNewSequence()
   {
     if (_device == null)
@@ -740,6 +819,22 @@ public class GEISSequenceItem : SequenceItem
     public float Time_s { get; init; }
     public int? RangeCode { get; init; }
     public float? Impedance_Ohm { get; init; }
+    public float? ImpedanceReal_Ohm { get; init; }
+    public float? ImpedanceImaginary_Ohm { get; init; }
+    public float? NyquistImaginary_Ohm { get; init; }
+    public float? CounterImpedance_Ohm { get; init; }
+    public float? CounterImpedanceReal_Ohm { get; init; }
+    public float? CounterImpedanceImaginary_Ohm { get; init; }
     public uint[] RawData { get; init; } = [];
+  }
+
+  private sealed class GeisCollectionDiagnostics
+  {
+    public int ProcessZeroAccepted { get; set; }
+    public int ProcessOneRowsSeen { get; set; }
+    public int ProcessOneAccepted { get; set; }
+    public int ProcessOneDuplicates { get; set; }
+    public int ProcessOneShortRows { get; set; }
+    public List<float> ProcessOneAcceptedFrequencies { get; } = [];
   }
 }

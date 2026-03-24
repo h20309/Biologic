@@ -28,10 +28,15 @@ DEFAULT_MONITOR_NODES: Dict[str, str] = {
 }
 
 DEFAULT_METHOD_NODE_IDS: Dict[str, str] = {
+    "ConnectDevice": "ns=3;i=7002",
+    "LoadFirmware": "ns=3;i=7003",
     "RunOCV": "ns=3;i=7000",
     "RunPEIS": "ns=3;i=7001",
     "RunGEIS": "ns=3;i=7004",
     "Charge": "ns=3;i=7005",
+    "LoadTechnique": "ns=3;i=7006",
+    "RunCV": "ns=3;i=7007",
+    "DisconnectDevice": "ns=3;i=7008",
     "Discharge": "ns=3;i=7009",
     "ForceStopChannel": "ns=3;i=7010",
 }
@@ -73,6 +78,36 @@ def get_opcua_node(client: Client, node_id: Any):
     return client.get_node(parse_node_id(node_id))
 
 
+def normalize_state_text(state_value: Any) -> str:
+    if state_value is None:
+        return ""
+    return str(state_value).strip().upper()
+
+
+def is_biologic_channel_active(values: Dict[str, Any]) -> bool:
+    is_busy = values.get("IsBusy")
+    if isinstance(is_busy, bool):
+        return is_busy
+
+    normalized_state = normalize_state_text(values.get("State"))
+    return normalized_state not in {"", "STOP", "0"}
+
+
+def get_sequence_result_marker(values: Dict[str, Any], marker_kind: Optional[str]) -> Optional[str]:
+    if not marker_kind:
+        return None
+
+    if marker_kind == "eis":
+        marker = values.get("LatestEISRunId") or values.get("LatestEISTimestamp")
+        return None if marker in (None, "") else str(marker)
+
+    if marker_kind == "charge":
+        marker = values.get("LatestChargeUpdatedAt")
+        return None if marker in (None, "") else str(marker)
+
+    return None
+
+
 def ensure_session_state() -> None:
     defaults: Dict[str, Any] = {
         "data_history": {},
@@ -83,6 +118,7 @@ def ensure_session_state() -> None:
         "monitor_snapshot": None,
         "biologic_snapshot": None,
         "last_method_response": None,
+        "active_sequence_run": None,
         "command_history": [],
         "discovered_servers": [],
         "selected_server_url": None,
@@ -542,6 +578,16 @@ def get_biologic_method_target(server_url: Optional[str], method_name: str) -> O
     return resolve_biologic_method_target(method_name, layout)
 
 
+def get_available_biologic_methods(server_url: Optional[str]) -> List[str]:
+    layout = get_biologic_layout(server_url)
+    discovered_methods = layout.get("method_node_ids", {}) if layout and layout.get("success") else {}
+    if discovered_methods:
+        method_names = set(discovered_methods.keys())
+    else:
+        method_names = set(DEFAULT_METHOD_NODE_IDS.keys())
+    return sorted(method_names)
+
+
 def get_biologic_channel_node_id(server_url: Optional[str]) -> str:
     layout = get_biologic_layout(server_url)
     if layout and layout.get("success"):
@@ -695,6 +741,8 @@ def disconnect_active_server() -> None:
     st.session_state.active_server_url = None
     st.session_state.monitor_snapshot = None
     st.session_state.biologic_snapshot = None
+    st.session_state.last_method_response = None
+    st.session_state.active_sequence_run = None
     st.session_state.available_nodes = []
     st.session_state.selected_nodes = []
     st.session_state.data_history = {}
