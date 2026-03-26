@@ -3,6 +3,7 @@ using Biologic.Devices;
 using Biologic.Native;
 using Biologic.SequenceItems;
 using DeviceControlSoftware;
+using Serilog;
 using System.Text.Json;
 
 namespace Biologic;
@@ -30,11 +31,24 @@ public class ECLabSystem : SequenceDispatcher
 
     // Get device configuration from settings
     string deviceName = eclabSettings?.GetValueOrDefault("DeviceName")?.ToString() ?? "EC-LAB";
+    string adapterMode = eclabSettings?.GetValueOrDefault("AdapterMode")?.ToString() ?? "Real";
     string address = eclabSettings?.GetValueOrDefault("Address")?.ToString() ?? "USB0";
     int timeoutMs = int.Parse(eclabSettings?.GetValueOrDefault("TimeoutMs")?.ToString() ?? "5000");
     string? techniquesPath = eclabSettings?.GetValueOrDefault("TechniquesPath")?.ToString();
     string? eclibDirectory = eclabSettings?.GetValueOrDefault("ECLibDirectory")?.ToString()
       ?? eclabSettings?.GetValueOrDefault("LibraryPath")?.ToString();
+
+    // Configure native backend based on AdapterMode (mirrors Nuvoton pattern)
+    if (string.Equals(adapterMode, "Mock", StringComparison.OrdinalIgnoreCase))
+    {
+      int mockRunDuration = int.TryParse(eclabSettings?.GetValueOrDefault("MockRunDurationSeconds")?.ToString(), out int dur) ? dur : 10;
+      ECLibApi.SetNative(new MockECLibNative(channelCount: 1, techniqueRunDurationSeconds: mockRunDuration));
+      Log.Information("ECLabSystem: Using MockECLibNative adapter (MockRunDurationSeconds={Duration})", mockRunDuration);
+    }
+    else
+    {
+      ECLibApi.SetNative(new RealECLibNative());
+    }
 
     // Create communication
     this.communication = new ECLabCommunication(address, timeoutMs);

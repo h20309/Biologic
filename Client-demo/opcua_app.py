@@ -901,41 +901,71 @@ def render_command_history() -> None:
     st.dataframe(history_df, width="stretch", hide_index=True)
 
 
-def render_spectrum_view(result: Dict[str, Any]) -> None:
-    spectrum = result.get("Spectrum") if isinstance(result, dict) else None
-    if not isinstance(spectrum, list) or not spectrum:
-        st.info("The selected result does not contain spectrum points.")
+def render_spectrum_view(selected_items: List[Dict[str, Any]]) -> None:
+    if not selected_items:
+        st.info("Select at least one history item to render the Nyquist plot.")
         return
 
     st.markdown("#### Spectrum Viewer")
-    spectrum_df = pd.DataFrame(spectrum)
-    st.dataframe(spectrum_df, width="stretch", hide_index=True)
 
-    if {"ImpedanceReal_Ohm", "NyquistImaginary_Ohm"}.issubset(spectrum_df.columns):
-        nyquist_df = spectrum_df.dropna(subset=["ImpedanceReal_Ohm", "NyquistImaginary_Ohm"]).copy()
-    elif {"Impedance_Ohm", "PhaseZwe"}.issubset(spectrum_df.columns):
-        nyquist_df = spectrum_df.dropna(subset=["Impedance_Ohm", "PhaseZwe"]).copy()
-        nyquist_df["ImpedanceReal_Ohm"] = nyquist_df["Impedance_Ohm"] * nyquist_df["PhaseZwe"].map(math.cos)
-        nyquist_df["NyquistImaginary_Ohm"] = -nyquist_df["Impedance_Ohm"] * nyquist_df["PhaseZwe"].map(math.sin)
-    else:
-        nyquist_df = pd.DataFrame()
+    combined_spectrum_frames: List[pd.DataFrame] = []
+    raw_results: Dict[str, Any] = {}
+    chart = go.Figure()
 
-    if not nyquist_df.empty:
+    for index, item in enumerate(selected_items, start=1):
+        if not isinstance(item, dict):
+            continue
+
+        result = item.get("Result")
+        spectrum = result.get("Spectrum") if isinstance(result, dict) else None
+        if not isinstance(spectrum, list) or not spectrum:
+            continue
+
+        trace_label = str(
+            item.get("RunId")
+            or item.get("CompletedAtUtc")
+            or item.get("SequenceName")
+            or f"Trace {index}"
+        )
+        spectrum_df = pd.DataFrame(spectrum)
+        spectrum_df.insert(0, "Trace", trace_label)
+        combined_spectrum_frames.append(spectrum_df)
+        raw_results[trace_label] = result
+
+        if {"ImpedanceReal_Ohm", "NyquistImaginary_Ohm"}.issubset(spectrum_df.columns):
+            nyquist_df = spectrum_df.dropna(subset=["ImpedanceReal_Ohm", "NyquistImaginary_Ohm"]).copy()
+        elif {"Impedance_Ohm", "PhaseZwe"}.issubset(spectrum_df.columns):
+            nyquist_df = spectrum_df.dropna(subset=["Impedance_Ohm", "PhaseZwe"]).copy()
+            nyquist_df["ImpedanceReal_Ohm"] = nyquist_df["Impedance_Ohm"] * nyquist_df["PhaseZwe"].map(math.cos)
+            nyquist_df["NyquistImaginary_Ohm"] = -nyquist_df["Impedance_Ohm"] * nyquist_df["PhaseZwe"].map(math.sin)
+        else:
+            nyquist_df = pd.DataFrame()
+
+        if nyquist_df.empty:
+            continue
+
         if "Frequency_Hz" in nyquist_df.columns:
             nyquist_df = nyquist_df.sort_values(by="Frequency_Hz", ascending=False)
 
-        chart = go.Figure()
         chart.add_trace(
             go.Scatter(
                 x=nyquist_df["ImpedanceReal_Ohm"],
                 y=nyquist_df["NyquistImaginary_Ohm"],
                 mode="lines+markers",
-                name="Nyquist",
-                line=dict(color="#1f77b4", width=2),
+                name=trace_label,
                 customdata=nyquist_df.get("Frequency_Hz"),
-                hovertemplate="Re(Z): %{x:.6g} Ohm<br>-Im(Z): %{y:.6g} Ohm<br>f: %{customdata:.6g} Hz<extra></extra>",
+                hovertemplate="Trace: %{fullData.name}<br>Re(Z): %{x:.6g} Ohm<br>-Im(Z): %{y:.6g} Ohm<br>f: %{customdata:.6g} Hz<extra></extra>",
             )
         )
+
+    if combined_spectrum_frames:
+        combined_spectrum_df = pd.concat(combined_spectrum_frames, ignore_index=True)
+        st.dataframe(combined_spectrum_df, width="stretch", hide_index=True)
+    else:
+        st.info("The selected history items do not contain spectrum points.")
+        return
+
+    if chart.data:
         chart.update_layout(
             title="Nyquist Plot",
             xaxis=dict(title="Re(Z) (Ohm)"),
@@ -943,13 +973,15 @@ def render_spectrum_view(result: Dict[str, Any]) -> None:
             hovermode="closest",
             height=420,
             margin=dict(l=60, r=30, t=60, b=60),
+            showlegend=True,
+            legend=dict(title="Trace"),
         )
         st.plotly_chart(chart, width="stretch")
     else:
-        st.info("Spectrum data does not contain enough impedance fields to render a Nyquist plot.")
+        st.info("The selected spectrum data does not contain enough impedance fields to render a Nyquist plot.")
 
     with st.expander("Raw Result JSON", expanded=False):
-        st.json(result)
+        st.json(raw_results)
 
 
 def render_eis_panels(snapshot: Optional[Dict[str, Any]], server_url: str) -> None:
@@ -1015,10 +1047,11 @@ def render_eis_panels(snapshot: Optional[Dict[str, Any]], server_url: str) -> No
             if isinstance(item, dict)
         }
 
-        selected_label = st.selectbox("Select a history item", list(options.keys()))
-        selected_item = options[selected_label]
-        selected_result = selected_item.get("Result", {}) if isinstance(selected_item, dict) else {}
-        render_spectrum_view(selected_result)
+        option_labels = list(options.keys())
+        default_labels = option_labels[:1]
+        selected_labels = st.multiselect("Select history items", option_labels, default=default_labels)
+        selected_items = [options[label] for label in selected_labels]
+        render_spectrum_view(selected_items)
 
 
 def render_charge_trend_panel(snapshot: Optional[Dict[str, Any]], server_url: str) -> None:

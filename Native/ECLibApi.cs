@@ -15,6 +15,20 @@ namespace Biologic.Native;
 public class ECLibApi
 {
   private static readonly object NativeCallSync = new();
+  private static IECLibNative native = new RealECLibNative();
+
+  /// <summary>
+  /// Replace the native backend (e.g. inject <see cref="MockECLibNative"/> for testing).
+  /// </summary>
+  internal static void SetNative(IECLibNative instance)
+  {
+    native = instance ?? throw new ArgumentNullException(nameof(instance));
+  }
+
+  /// <summary>
+  /// True when the current native backend is a mock (no real hardware).
+  /// </summary>
+  public static bool IsMockMode => native is MockECLibNative;
 
   #region Connection Management
 
@@ -61,7 +75,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall($"Connect to {address}", () =>
     {
-      int errorCode = ECLibNative.BL_Connect(address, timeout, out int deviceId, out DeviceInfo info);
+      int errorCode = native.BL_Connect(address, timeout, out int deviceId, out DeviceInfo info);
       CheckError(errorCode, $"Connect to {address}");
       return (deviceId, info);
     });
@@ -132,7 +146,7 @@ public class ECLibApi
   {
     ExecuteNativeCall($"Disconnect device {deviceId}", () =>
     {
-      int errorCode = ECLibNative.BL_Disconnect(deviceId);
+      int errorCode = native.BL_Disconnect(deviceId);
       CheckError(errorCode, $"Disconnect device {deviceId}");
     });
   }
@@ -146,7 +160,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall($"TestConnection for device {deviceId}", () =>
     {
-      int errorCode = ECLibNative.BL_TestConnection(deviceId);
+      int errorCode = native.BL_TestConnection(deviceId);
       return errorCode == 0;
     });
   }
@@ -167,7 +181,7 @@ public class ECLibApi
       {
         var versionStr = new StringBuilder(256);
         uint size = (uint)versionStr.Capacity;
-        int errorCode = ECLibNative.BL_GetLibVersion(versionStr, ref size);
+        int errorCode = native.BL_GetLibVersion(versionStr, ref size);
 
         CheckError(errorCode, "GetLibVersion");
 
@@ -192,7 +206,7 @@ public class ECLibApi
 
   public static string? GetLoadedLibraryPath()
   {
-    return ECLibNative.GetLoadedModulePath("EClib64.dll");
+    return native.GetLoadedModulePath("EClib64.dll");
   }
 
   /// <summary>
@@ -206,7 +220,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetChannelInfo for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_GetChannelInfos(deviceId, channelByte, out ChannelInfo info);
+      int errorCode = native.BL_GetChannelInfos(deviceId, channelByte, out ChannelInfo info);
       CheckError(errorCode, $"GetChannelInfo for device {deviceId}, channel {channel}");
       return info;
     });
@@ -222,7 +236,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetChannelsPlugged for device {deviceId}", () =>
     {
       byte[] channels = new byte[16];
-      int errorCode = ECLibNative.BL_GetChannelsPlugged(deviceId, channels, (byte)channels.Length);
+      int errorCode = native.BL_GetChannelsPlugged(deviceId, channels, (byte)channels.Length);
       CheckError(errorCode, $"GetChannelsPlugged for device {deviceId}");
 
       var pluggedChannels = new List<int>();
@@ -253,7 +267,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetChannelBoardType for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_GetChannelBoardType(deviceId, channelByte, out uint boardType);
+      int errorCode = native.BL_GetChannelBoardType(deviceId, channelByte, out uint boardType);
       CheckError(errorCode, $"GetChannelBoardType for device {deviceId}, channel {channel}");
 
       return boardType switch
@@ -285,7 +299,7 @@ public class ECLibApi
       {
         uint size = 1024;
         var buffer = new StringBuilder((int)size);
-        int errorCode = ECLibNative.BL_GetMessage(deviceId, channelByte, buffer, ref size);
+        int errorCode = native.BL_GetMessage(deviceId, channelByte, buffer, ref size);
         if (errorCode != 0)
         {
           break;
@@ -317,7 +331,7 @@ public class ECLibApi
       }
 
       byte channelByte = (byte)(channel - 1);
-      int errorCode = ECLibNative.BL_GetOptErr(deviceId, channelByte, out int optError, out int optPos);
+      int errorCode = native.BL_GetOptErr(deviceId, channelByte, out int optError, out int optPos);
       if (errorCode != 0)
       {
         return ((int OptError, int OptPos)?)null;
@@ -351,7 +365,7 @@ public class ECLibApi
       {
         var errorMsg = new StringBuilder(256);
         int result = ExecuteNativeCall($"GetErrorMessage for error code {errorCode}", () =>
-          ECLibNative.BL_GetErrorMsg(errorCode, errorMsg, errorMsg.Capacity));
+          native.BL_GetErrorMsg(errorCode, errorMsg, errorMsg.Capacity));
         
         if (result == 0 && errorMsg.Length > 0)
         {
@@ -374,7 +388,7 @@ public class ECLibApi
       var errorMsg = new StringBuilder(256);
       ExecuteNativeCall($"GetErrorMessage for error code {errorCode}", () =>
       {
-        ECLibNative.BL_GetErrorMsg(errorCode, errorMsg, errorMsg.Capacity);
+        native.BL_GetErrorMsg(errorCode, errorMsg, errorMsg.Capacity);
       });
       string message = errorMsg.ToString().TrimEnd('\0');
       return string.IsNullOrWhiteSpace(message) ? $"Unknown error code: {errorCode}" : message;
@@ -430,7 +444,7 @@ public class ECLibApi
       Log.Information("  FPGA path:         {Path}", fpgaPath ?? "(null - using default)");
 
       int[] results = new int[16];
-      int errorCode = ECLibNative.BL_LoadFirmware(
+      int errorCode = native.BL_LoadFirmware(
         deviceId,
         channelMap,
         results,
@@ -467,7 +481,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall($"DefineBoolParameter '{label}'", () =>
     {
-      int errorCode = ECLibNative.BL_DefineBoolParameter(label, value, index, out EccParam parameter);
+      int errorCode = native.BL_DefineBoolParameter(label, value, index, out EccParam parameter);
       CheckError(errorCode, $"DefineBoolParameter '{label}'");
       return parameter;
     });
@@ -480,7 +494,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall($"DefineIntParameter '{label}'", () =>
     {
-      int errorCode = ECLibNative.BL_DefineIntParameter(label, value, index, out EccParam parameter);
+      int errorCode = native.BL_DefineIntParameter(label, value, index, out EccParam parameter);
       CheckError(errorCode, $"DefineIntParameter '{label}'");
       return parameter;
     });
@@ -493,7 +507,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall($"DefineSingleParameter '{label}'", () =>
     {
-      int errorCode = ECLibNative.BL_DefineSglParameter(label, value, index, out EccParam parameter);
+      int errorCode = native.BL_DefineSglParameter(label, value, index, out EccParam parameter);
       CheckError(errorCode, $"DefineSingleParameter '{label}'");
       return parameter;
     });
@@ -516,7 +530,7 @@ public class ECLibApi
       try
       {
         byte channelByte = (byte)(channel - 1); // Convert to 0-based
-        int errorCode = ECLibNative.BL_LoadTechnique(
+        int errorCode = native.BL_LoadTechnique(
           deviceId,
           channelByte,
           eccFilePath,
@@ -542,7 +556,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetTechniqueInfos for device {deviceId}, channel {channel}, index {index}", () =>
     {
       byte channelByte = (byte)(channel - 1);
-      int errorCode = ECLibNative.BL_GetTechniqueInfos(deviceId, channelByte, index, out TechniqueInfos infos);
+      int errorCode = native.BL_GetTechniqueInfos(deviceId, channelByte, index, out TechniqueInfos infos);
       CheckError(errorCode, $"GetTechniqueInfos for device {deviceId}, channel {channel}, index {index}");
       return infos;
     });
@@ -553,7 +567,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetParamInfos for device {deviceId}, channel {channel}, index {index}", () =>
     {
       byte channelByte = (byte)(channel - 1);
-      int errorCode = ECLibNative.BL_GetParamInfos(deviceId, channelByte, index, out TechniqueInfos infos);
+      int errorCode = native.BL_GetParamInfos(deviceId, channelByte, index, out TechniqueInfos infos);
       CheckError(errorCode, $"GetParamInfos for device {deviceId}, channel {channel}, index {index}");
       return infos;
     });
@@ -605,7 +619,7 @@ public class ECLibApi
     ExecuteNativeCall($"StartChannel for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_StartChannel(deviceId, channelByte);
+      int errorCode = native.BL_StartChannel(deviceId, channelByte);
       CheckError(errorCode, $"StartChannel for device {deviceId}, channel {channel}");
     });
   }
@@ -627,7 +641,7 @@ public class ECLibApi
       }
 
       int[] results = new int[16];
-      int errorCode = ECLibNative.BL_StartChannels(deviceId, channelMap, results, (byte)results.Length);
+      int errorCode = native.BL_StartChannels(deviceId, channelMap, results, (byte)results.Length);
       CheckError(errorCode, $"StartChannels for device {deviceId}");
 
       var resultDict = new Dictionary<int, int>();
@@ -651,7 +665,7 @@ public class ECLibApi
     ExecuteNativeCall($"StopChannel for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_StopChannel(deviceId, channelByte);
+      int errorCode = native.BL_StopChannel(deviceId, channelByte);
       CheckError(errorCode, $"StopChannel for device {deviceId}, channel {channel}");
     });
   }
@@ -673,7 +687,7 @@ public class ECLibApi
       }
 
       int[] results = new int[16];
-      int errorCode = ECLibNative.BL_StopChannels(deviceId, channelMap, results, (byte)results.Length);
+      int errorCode = native.BL_StopChannels(deviceId, channelMap, results, (byte)results.Length);
       CheckError(errorCode, $"StopChannels for device {deviceId}");
 
       var resultDict = new Dictionary<int, int>();
@@ -701,7 +715,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetCurrentValues for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_GetCurrentValues(deviceId, channelByte, out CurrentValues values);
+      int errorCode = native.BL_GetCurrentValues(deviceId, channelByte, out CurrentValues values);
       CheckError(errorCode, $"GetCurrentValues for device {deviceId}, channel {channel}");
       return values;
     });
@@ -716,7 +730,7 @@ public class ECLibApi
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
       uint[] dataBuffer = new uint[1000];
-      int errorCode = ECLibNative.BL_GetData(
+      int errorCode = native.BL_GetData(
         deviceId,
         channelByte,
         dataBuffer,
@@ -734,7 +748,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall("ConvertNumericIntoSingle", () =>
     {
-      int errorCode = ECLibNative.BL_ConvertNumericIntoSingle(numericValue, out float floatValue);
+      int errorCode = native.BL_ConvertNumericIntoSingle(numericValue, out float floatValue);
       CheckError(errorCode, "ConvertNumericIntoSingle");
       return floatValue;
     });
@@ -747,7 +761,7 @@ public class ECLibApi
   {
     return ExecuteNativeCall("ConvertChannelNumericIntoSingle", () =>
     {
-      int errorCode = ECLibNative.BL_ConvertChannelNumericIntoSingle(numericValue, out float floatValue, boardType);
+      int errorCode = native.BL_ConvertChannelNumericIntoSingle(numericValue, out float floatValue, boardType);
       CheckError(errorCode, "ConvertChannelNumericIntoSingle");
       return floatValue;
     });
@@ -761,7 +775,7 @@ public class ECLibApi
     return ExecuteNativeCall("ConvertTimeChannelNumericIntoSeconds", () =>
     {
       uint[] timeData = [highValue, lowValue];
-      int errorCode = ECLibNative.BL_ConvertTimeChannelNumericIntoSeconds(timeData, out double timeSeconds, timeBase, boardType);
+      int errorCode = native.BL_ConvertTimeChannelNumericIntoSeconds(timeData, out double timeSeconds, timeBase, boardType);
       CheckError(errorCode, "ConvertTimeChannelNumericIntoSeconds");
       return timeSeconds;
     });
@@ -805,7 +819,7 @@ public class ECLibApi
     return ExecuteNativeCall($"GetHardwareConfiguration for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_GetHardConf(deviceId, channelByte, out HardwareConf conf);
+      int errorCode = native.BL_GetHardConf(deviceId, channelByte, out HardwareConf conf);
       CheckError(errorCode, $"GetHardwareConfiguration for device {deviceId}, channel {channel}");
       return conf;
     });
@@ -823,7 +837,7 @@ public class ECLibApi
     ExecuteNativeCall($"SetHardwareConfiguration for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_SetHardConf(deviceId, channelByte, (int)connection, (int)mode);
+      int errorCode = native.BL_SetHardConf(deviceId, channelByte, (int)connection, (int)mode);
       CheckError(errorCode, $"SetHardwareConfiguration for device {deviceId}, channel {channel}");
     });
   }
@@ -840,7 +854,7 @@ public class ECLibApi
     return ExecuteNativeCall($"TestCommSpeed for device {deviceId}, channel {channel}", () =>
     {
       byte channelByte = (byte)(channel - 1); // Convert to 0-based
-      int errorCode = ECLibNative.BL_TestCommSpeed(
+      int errorCode = native.BL_TestCommSpeed(
         deviceId,
         channelByte,
         out int rcvtSpeed,
