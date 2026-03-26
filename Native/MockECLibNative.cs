@@ -302,7 +302,18 @@ internal sealed class MockECLibNative : IECLibNative
         }
       }
 
-      Log.Information("MockECLibNative: Technique '{Technique}' loaded on channel {Channel}", eccFile, channel);
+      if (IsEisTechnique(eccFile))
+      {
+        Log.Information(
+          "MockECLibNative: EIS technique '{Technique}' loaded on channel {Channel}. " +
+          "EisSpectrumTotal={SpectrumTotal}, InitialFreq={InitialFreq}, FinalFreq={FinalFreq}",
+          eccFile, channel, chState.EisSpectrumTotal, chState.EisInitialFrequency, chState.EisFinalFrequency);
+      }
+      else
+      {
+        Log.Information("MockECLibNative: Technique '{Technique}' loaded on channel {Channel}", eccFile, channel);
+      }
+
       return 0;
     }
   }
@@ -585,8 +596,8 @@ internal sealed class MockECLibNative : IECLibNative
     }
 
     // Phase 1: Emit all remaining spectrum rows (process 1) in a single call.
-    // Returning all points at once prevents concurrent BL_GetData callers
-    // (e.g. OPC UA polling) from consuming data meant for the GEIS collection loop.
+    // Returning all points at once mirrors real hardware behavior where the
+    // instrument fills the data buffer with as many rows as it can per call.
     if (chState.EisProcessPhase == 1)
     {
       int remaining = chState.EisSpectrumTotal - chState.EisSpectrumEmitted;
