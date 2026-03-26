@@ -85,16 +85,6 @@ public class GEISSequenceItem : SequenceItem
       throw new InvalidOperationException($"Channel {_channelIndex} does not support impedance techniques (Zboard == 0)");
     }
 
-    var currentValues = ECLibApi.GetCurrentValues(_deviceId, _channelIndex + 1);
-    Log.Information(
-      "Channel {Channel} live ranges before GEIS: Ewe={Ewe}V, ERange=[{Min}V, {Max}V], I={Current}A, IRange={IRange}",
-      _channelIndex,
-      currentValues.Ewe,
-      currentValues.EweRangeMin,
-      currentValues.EweRangeMax,
-      currentValues.I,
-      currentValues.IRange);
-
     _parameters = this.BuildGeisParameters(
       currentStep: _dcCurrent_A,
       amplitudeCurrent: _acAmplitude_A,
@@ -134,7 +124,6 @@ public class GEISSequenceItem : SequenceItem
           _channelIndex);
       }
 
-          this.ResetChannelBeforeGeis();
           this.EnsureChannelReadyForNewSequence();
 
       this.LoadGeisTechniqueWithFallbacks("geis.ecc");
@@ -189,7 +178,7 @@ public class GEISSequenceItem : SequenceItem
       if (automation != null)
       {
         string fullResultJson = SequenceDispatcher.Serialize(fullResult);
-        automation.PublishGeisResultPayload(context.ID, "RunGEIS", DateTime.UtcNow, fullResultJson);
+        automation.PublishEisResultPayload(context.ID, "RunGEIS", DateTime.UtcNow, fullResultJson);
       }
 
       context.ResultParameter = new
@@ -256,12 +245,10 @@ public class GEISSequenceItem : SequenceItem
   {
     var spectrumPoints = new List<GeisSpectrumPoint>();
     var seenKeys = new HashSet<string>(StringComparer.Ordinal);
-    var collectionDiagnostics = new GeisCollectionDiagnostics();
     DateTime deadline = DateTime.UtcNow + DefaultTimeout;
     bool stopObserved = false;
     DateTime? stopDrainDeadline = null;
     int emptyReadsAfterStop = 0;
-    string? lastFrameSignature = null;
 
     while (DateTime.UtcNow < deadline)
     {
@@ -281,14 +268,8 @@ public class GEISSequenceItem : SequenceItem
       }
 
       var (latestValues, dataInfo, dataBuffer) = ECLibApi.GetData(_deviceId, _channelIndex + 1);
-      string frameSignature = $"tech={dataInfo.TechniqueID},process={dataInfo.ProcessIndex},rows={dataInfo.NbRows},cols={dataInfo.NbCols},state={latestValues.State}";
-      if (dataInfo.NbRows > 0 && !StringComparer.Ordinal.Equals(lastFrameSignature, frameSignature))
-      {
-        Log.Information("GEIS data frame on channel {Channel}: {Frame}", _channelIndex, frameSignature);
-        lastFrameSignature = frameSignature;
-      }
 
-      ParseDataBuffer(latestValues, dataInfo, dataBuffer, boardType, seenKeys, processZeroPoints, spectrumPoints, collectionDiagnostics);
+      ParseDataBuffer(latestValues, dataInfo, dataBuffer, boardType, seenKeys, processZeroPoints, spectrumPoints);
 
       if (stopObserved)
       {
@@ -318,35 +299,9 @@ public class GEISSequenceItem : SequenceItem
       throw new TimeoutException($"GEIS did not finish within {DefaultTimeout.TotalMinutes:F1} minutes on channel {_channelIndex}.");
     }
 
-    Log.Information(
-      "GEIS collection summary on channel {Channel}: Process0Accepted={Process0Accepted}, Process1RowsSeen={Process1RowsSeen}, Process1Accepted={Process1Accepted}, Process1Duplicates={Process1Duplicates}, Process1ShortRows={Process1ShortRows}, FinalSpectrumPoints={FinalSpectrumPoints}",
-      _channelIndex,
-      collectionDiagnostics.ProcessZeroAccepted,
-      collectionDiagnostics.ProcessOneRowsSeen,
-      collectionDiagnostics.ProcessOneAccepted,
-      collectionDiagnostics.ProcessOneDuplicates,
-      collectionDiagnostics.ProcessOneShortRows,
-      spectrumPoints.Count);
-
-    Log.Information(
-      "GEIS process 1 accepted frequencies on channel {Channel}: Count={Count}, FrequenciesHz=[{Frequencies}]",
-      _channelIndex,
-      collectionDiagnostics.ProcessOneAcceptedFrequencies.Count,
-      FormatFrequencyList(collectionDiagnostics.ProcessOneAcceptedFrequencies));
+    Log.Information("GEIS collection completed on channel {Channel} with {PointCount} spectrum points.", _channelIndex, spectrumPoints.Count);
 
     return spectrumPoints;
-  }
-
-  private static string FormatFrequencyList(IReadOnlyList<float> frequencies)
-  {
-    if (frequencies.Count == 0)
-    {
-      return "<none>";
-    }
-
-    return string.Join(
-      ", ",
-      frequencies.Select(frequency => frequency.ToString("G9", System.Globalization.CultureInfo.InvariantCulture)));
   }
 
   private void ParseDataBuffer(
@@ -356,8 +311,7 @@ public class GEISSequenceItem : SequenceItem
     uint boardType,
     HashSet<string> seenKeys,
     List<object> processZeroPoints,
-    List<GeisSpectrumPoint> spectrumPoints,
-    GeisCollectionDiagnostics collectionDiagnostics)
+    List<GeisSpectrumPoint> spectrumPoints)
   {
     if (dataInfo.NbRows <= 0 || dataInfo.NbCols <= 0)
     {
@@ -412,7 +366,6 @@ public class GEISSequenceItem : SequenceItem
           Potential_V = ewe,
           Current_A = processZeroCurrent
         });
-        collectionDiagnostics.ProcessZeroAccepted++;
 
         continue;
       }
@@ -422,18 +375,14 @@ public class GEISSequenceItem : SequenceItem
         continue;
       }
 
-      collectionDiagnostics.ProcessOneRowsSeen++;
-
       if (dataInfo.NbCols < 14)
       {
-        collectionDiagnostics.ProcessOneShortRows++;
         continue;
       }
 
       string spectrumKey = $"p1:{dataBuffer[offset + 0]}:{dataBuffer[offset + 13]}";
       if (!seenKeys.Add(spectrumKey))
       {
-        collectionDiagnostics.ProcessOneDuplicates++;
         continue;
       }
 
@@ -489,8 +438,6 @@ public class GEISSequenceItem : SequenceItem
         CounterImpedanceImaginary_Ohm = counterImpedanceComponents?.Imaginary_Ohm,
         RawData = dataBuffer.Skip(offset).Take(dataInfo.NbCols).ToArray()
       });
-      collectionDiagnostics.ProcessOneAccepted++;
-      collectionDiagnostics.ProcessOneAcceptedFrequencies.Add(frequency);
     }
   }
 
@@ -770,27 +717,6 @@ public class GEISSequenceItem : SequenceItem
     return defaultValue;
   }
 
-  private void ResetChannelBeforeGeis()
-  {
-    if (_device == null)
-    {
-      throw new InvalidOperationException("GEIS device context is not available.");
-    }
-
-    Log.Information(
-      "Performing pre-GEIS channel reset on channel {Channel} with forced firmware reload.",
-      _channelIndex);
-
-    bool resetSucceeded = _device.ResetChannelTechniqueState(_channelIndex, forceFirmwareReload: true);
-    if (!resetSucceeded)
-    {
-      throw new InvalidOperationException(
-        $"Pre-GEIS channel reset failed on channel {_channelIndex}. Check firmware reload and channel diagnostics.");
-    }
-
-    Log.Information("Pre-GEIS channel reset completed on channel {Channel}.", _channelIndex);
-  }
-
   private void EnsureChannelReadyForNewSequence()
   {
     if (_device == null)
@@ -828,13 +754,4 @@ public class GEISSequenceItem : SequenceItem
     public uint[] RawData { get; init; } = [];
   }
 
-  private sealed class GeisCollectionDiagnostics
-  {
-    public int ProcessZeroAccepted { get; set; }
-    public int ProcessOneRowsSeen { get; set; }
-    public int ProcessOneAccepted { get; set; }
-    public int ProcessOneDuplicates { get; set; }
-    public int ProcessOneShortRows { get; set; }
-    public List<float> ProcessOneAcceptedFrequencies { get; } = [];
-  }
 }
