@@ -820,10 +820,12 @@ internal class ChannelDataPoller
   private readonly uint boardType;
   private readonly int pollingIntervalMs;
   private readonly Action<ChannelDataBatch>? dataHandler;
-  private readonly CancellationToken cancellationToken;
+  private readonly CancellationToken externalToken;
+  private readonly CancellationTokenSource pollerCts = new();
   private readonly ConcurrentQueue<ChannelDataBatch> dataCache = new();
   private readonly int maxCacheSize = 100;
 
+  private CancellationTokenSource? linkedCts;
   private Task? pollingTask;
   private ChannelDataBatch? latestBatch;
 
@@ -839,7 +841,7 @@ internal class ChannelDataPoller
     this.boardType = ResolveBoardType(device, channel);
     this.pollingIntervalMs = pollingIntervalMs;
     this.dataHandler = dataHandler;
-    this.cancellationToken = cancellationToken;
+    this.externalToken = cancellationToken;
   }
 
   public void Start()
@@ -849,12 +851,21 @@ internal class ChannelDataPoller
       return;
     }
 
-    pollingTask = Task.Run(async () => await PollLoopAsync(), cancellationToken);
+    linkedCts = CancellationTokenSource.CreateLinkedTokenSource(externalToken, pollerCts.Token);
+    pollingTask = Task.Run(async () => await PollLoopAsync(linkedCts.Token), linkedCts.Token);
   }
 
   public void Stop()
   {
-    // Polling will stop when cancellationToken is triggered
+    pollerCts.Cancel();
+    try
+    {
+      pollingTask?.Wait(TimeSpan.FromSeconds(5));
+    }
+    catch (AggregateException)
+    {
+      // Expected when task is cancelled
+    }
   }
 
   public ChannelDataBatch? GetLatestBatch()
@@ -872,7 +883,7 @@ internal class ChannelDataPoller
     while (dataCache.TryDequeue(out _)) { }
   }
 
-  private async Task PollLoopAsync()
+  private async Task PollLoopAsync(CancellationToken cancellationToken)
   {
     Log.Debug("Starting poll loop for channel {Channel}", channel);
 
