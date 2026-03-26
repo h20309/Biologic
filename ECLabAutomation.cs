@@ -272,6 +272,12 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     this.chargeRunsByChannel[channel] = state;
     this.UpdateLatestChargeNodes(channel, state, "[]");
 
+    // Enable BL_GetData in the poller so Charge run can collect data points
+    if (channelPollers.TryGetValue(channel, out var poller))
+    {
+      poller.EnableDataAcquisition();
+    }
+
     Log.Information(
       "Initialized Charge run tracking for channel {Channel}. Target={Voltage}V, Duration={Duration}s, Csv={CsvPath}",
       channel,
@@ -359,6 +365,12 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     if (publishCompletedSnapshot)
     {
       seriesJson = PublishCompletedChargeSnapshot(state);
+
+      // Disable BL_GetData in the poller now that Charge run is complete
+      if (channelPollers.TryGetValue(batch.Channel, out var poller))
+      {
+        poller.DisableDataAcquisition();
+      }
     }
 
     this.UpdateLatestChargeNodes(batch.Channel, state, seriesJson);
@@ -828,6 +840,7 @@ internal class ChannelDataPoller
   private CancellationTokenSource? linkedCts;
   private Task? pollingTask;
   private ChannelDataBatch? latestBatch;
+  private volatile bool dataAcquisitionEnabled;
 
   public ChannelDataPoller(
       ECLabDevice device,
@@ -866,6 +879,9 @@ internal class ChannelDataPoller
     {
       // Expected when task is cancelled
     }
+
+    linkedCts?.Dispose();
+    pollerCts.Dispose();
   }
 
   public ChannelDataBatch? GetLatestBatch()
@@ -882,6 +898,26 @@ internal class ChannelDataPoller
   {
     while (dataCache.TryDequeue(out _)) { }
   }
+
+  /// <summary>
+  /// Enable BL_GetData calls during polling (for Charge run data acquisition).
+  /// </summary>
+  public void EnableDataAcquisition()
+  {
+    dataAcquisitionEnabled = true;
+    Log.Debug("Data acquisition enabled for channel {Channel}", channel);
+  }
+
+  /// <summary>
+  /// Disable BL_GetData calls during polling. Only BL_GetCurrentValues will be called.
+  /// </summary>
+  public void DisableDataAcquisition()
+  {
+    dataAcquisitionEnabled = false;
+    Log.Debug("Data acquisition disabled for channel {Channel}", channel);
+  }
+
+  public bool IsDataAcquisitionEnabled => dataAcquisitionEnabled;
 
   private async Task PollLoopAsync(CancellationToken cancellationToken)
   {
@@ -908,7 +944,7 @@ internal class ChannelDataPoller
           TechniqueId = latestBatch?.TechniqueId ?? default
         };
 
-        if ((PROG_STATE)currentValues.State == PROG_STATE.RUN)
+        if ((PROG_STATE)currentValues.State == PROG_STATE.RUN && dataAcquisitionEnabled)
         {
           try
           {

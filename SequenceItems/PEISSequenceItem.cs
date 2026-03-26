@@ -100,7 +100,6 @@ public class PEISSequenceItem : SequenceItem
   public override Sequence.ResultTypes Execute(Sequence.StateContext context)
   {
     ECLabAutomation? automation = context.SequenceDispatcher as ECLabAutomation;
-    bool restartPollingAfterPeis = false;
 
     try
     {
@@ -111,15 +110,6 @@ public class PEISSequenceItem : SequenceItem
       if (_device == null || !_device.IsConnected || _device.DeviceId < 0)
       {
         throw new InvalidOperationException("Device is not connected");
-      }
-
-      if (automation?.IsPollingEnabled == true)
-      {
-        automation.StopPolling(_channelIndex);
-        restartPollingAfterPeis = true;
-        Log.Information(
-          "Temporarily stopped OPC UA polling for channel {Channel} while synchronously collecting PEIS BL_GetData results.",
-          _channelIndex);
       }
 
       this.EnsureChannelReadyForNewSequence();
@@ -222,11 +212,8 @@ public class PEISSequenceItem : SequenceItem
     }
     finally
     {
-      if (restartPollingAfterPeis && automation?.IsPollingEnabled == true)
-      {
-        automation.StartPolling(_channelIndex);
-        Log.Information("Restarted OPC UA polling for channel {Channel} after PEIS collection finished.", _channelIndex);
-      }
+      // Polling uses only BL_GetCurrentValues (non-destructive) so it can
+      // remain active during PEIS without consuming BL_GetData results.
     }
   }
 

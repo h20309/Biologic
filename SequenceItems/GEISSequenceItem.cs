@@ -102,7 +102,6 @@ public class GEISSequenceItem : SequenceItem
   public override Sequence.ResultTypes Execute(Sequence.StateContext context)
   {
     ECLabAutomation? automation = context.SequenceDispatcher as ECLabAutomation;
-    bool restartPollingAfterGeis = false;
 
     try
     {
@@ -113,15 +112,6 @@ public class GEISSequenceItem : SequenceItem
       if (_device == null || !_device.IsConnected || _device.DeviceId < 0)
       {
         throw new InvalidOperationException("Device is not connected");
-      }
-
-      if (automation?.IsPollingEnabled == true)
-      {
-        automation.StopPolling(_channelIndex);
-        restartPollingAfterGeis = true;
-        Log.Information(
-          "Temporarily stopped OPC UA polling for channel {Channel} while synchronously collecting GEIS BL_GetData results.",
-          _channelIndex);
       }
 
           this.EnsureChannelReadyForNewSequence();
@@ -225,11 +215,8 @@ public class GEISSequenceItem : SequenceItem
     }
     finally
     {
-      if (restartPollingAfterGeis && automation?.IsPollingEnabled == true)
-      {
-        automation.StartPolling(_channelIndex);
-        Log.Information("Restarted OPC UA polling for channel {Channel} after GEIS collection finished.", _channelIndex);
-      }
+      // Polling uses only BL_GetCurrentValues (non-destructive) so it can
+      // remain active during GEIS without consuming BL_GetData results.
     }
   }
 
