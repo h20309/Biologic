@@ -69,8 +69,6 @@ public class ECLabSystem : SequenceDispatcher
 
     // Register sequence creators
     // Device management
-    this.AddSequenceCreator("ConnectDevice", (prop) => new ConnectDeviceSequenceItem { Properties = prop });
-    this.AddSequenceCreator("DisconnectDevice", (prop) => new DisconnectDeviceSequenceItem { Properties = prop });
     this.AddSequenceCreator("LoadFirmware", (prop) => new LoadFirmwareSequenceItem { Properties = prop });
 
     // Channel control
@@ -92,10 +90,6 @@ public class ECLabSystem : SequenceDispatcher
     // Data acquisition
     this.AddSequenceCreator("GetData", (prop) => new GetDataSequenceItem { Properties = prop });
     this.AddSequenceCreator("WaitForCompletion", (prop) => new WaitForCompletionSequenceItem { Properties = prop });
-    
-    // Data polling control
-    this.AddSequenceCreator("StartPolling", (prop) => new StartPollingSequenceItem { Properties = prop });
-    this.AddSequenceCreator("StopPolling", (prop) => new StopPollingSequenceItem { Properties = prop });
 
     // Register method parameter creators for OPC UA Methods
     // These enable dynamic technique execution via OPC UA with strongly-typed parameters

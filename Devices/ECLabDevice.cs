@@ -13,6 +13,17 @@ namespace Biologic.Devices;
 public class ECLabDevice : Device
 {
   public static readonly string DeviceName = "EC-LAB";
+
+  /// <summary>
+  /// Raised after Open() completes successfully (communication open + firmware loaded).
+  /// </summary>
+  public event Action? DeviceReady;
+
+  /// <summary>
+  /// Raised at the start of Close(), before communication is shut down.
+  /// </summary>
+  public event Action? DeviceClosing;
+
   private const int FirmwareLoadRetryCount = 3;
   private const int FirmwareLoadRetryDelayMs = 1500;
   private const bool ForceFirmwareReloadOnOpen = true;
@@ -151,6 +162,10 @@ public class ECLabDevice : Device
           "ECLab device {DeviceId} is already initialized with {ChannelCount} channel(s); skipping duplicate firmware load",
           this.communication.DeviceId,
           this.channelInfos.Count);
+
+        // Still fire DeviceReady so subscribers (e.g. polling) restart
+        // after a Stop → Start cycle where Stop does not call Close().
+        this.DeviceReady?.Invoke();
         return;
       }
 
@@ -160,6 +175,8 @@ public class ECLabDevice : Device
         throw new InvalidOperationException("Failed to initialize ECLab device - firmware loading failed");
       }
     }
+
+    this.DeviceReady?.Invoke();
   }
 
   /// <summary>
@@ -167,6 +184,7 @@ public class ECLabDevice : Device
   /// </summary>
   public override void Close()
   {
+    this.DeviceClosing?.Invoke();
     Log.Information("Closing ECLabDevice");
     this.isInitialized = false;
     this.channelInfos.Clear();

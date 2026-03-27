@@ -72,6 +72,19 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     // Call base class setup first
     base.Setup();
 
+    // Subscribe to DeviceReady so polling starts automatically when
+    // SequenceDispatcher.Start() calls device.Open()
+    var device = this.GetECLabDevice();
+    if (device != null)
+    {
+      device.DeviceReady += this.OnDeviceReady;
+      device.DeviceClosing += this.OnDeviceClosing;
+    }
+
+    // Subscribe to system status changes so we can stop pollers
+    // BEFORE the OPC UA server is torn down during shutdown
+    this.SystemStatus.Changed += this.OnSystemStatusChanged;
+
     this.SubscribeResultPublishers();
 
     // Read polling configuration from settings
@@ -92,24 +105,37 @@ public class ECLabAutomation : ECLabSystem, IDisposable
   }
 
   /// <summary>
-  /// Start the automation system
+  /// Handle ECLabDevice.DeviceReady event — auto-start polling after device opens.
+  /// Called by SequenceDispatcher.Start() → device.Open() → DeviceReady event.
   /// </summary>
-  /// <remarks>
-  /// Polling is not auto-started here.
-  /// Use ConnectDeviceSequenceItem to start polling after an explicit successful connection.
-  /// </remarks>
-  public new void Start()
+  private void OnDeviceReady()
   {
-    base.Start();
+    Log.Information("ECLabDevice ready, starting automatic polling");
+    this.EnsurePollingForConnectedChannels();
   }
 
   /// <summary>
-  /// Stop the automation system and clean up polling
+  /// Handle ECLabDevice.DeviceClosing event — stop all pollers before device closes.
+  /// This prevents OPC UA access violations when the server is shutting down.
   /// </summary>
-  public new void Stop()
+  private void OnDeviceClosing()
   {
-    StopAllPollers();
-    base.Stop();
+    Log.Information("ECLabDevice closing, stopping all pollers");
+    this.StopAllPollers();
+  }
+
+  /// <summary>
+  /// Handle SystemStatus.Changed — stop all pollers when system begins deinitializing.
+  /// SequenceDispatcher.Stop() fires "Deinitializing" BEFORE ORBIT calls server.Stop(),
+  /// so this ensures pollers are stopped before OPC UA native memory is freed.
+  /// </summary>
+  private void OnSystemStatusChanged(object? sender, DeviceControlSoftware.SystemStatus.StatusChangedEventArgs e)
+  {
+    if (e.Name == "Status" && e.Enable == "Deinitializing")
+    {
+      Log.Information("System deinitializing, stopping all pollers before OPC UA server shutdown");
+      this.StopAllPollers();
+    }
   }
 
   /// <summary>
@@ -807,6 +833,16 @@ public class ECLabAutomation : ECLabSystem, IDisposable
     {
       if (disposing)
       {
+        // Unsubscribe from device events
+        var device = this.GetECLabDevice();
+        if (device != null)
+        {
+          device.DeviceReady -= this.OnDeviceReady;
+          device.DeviceClosing -= this.OnDeviceClosing;
+        }
+
+        this.SystemStatus.Changed -= this.OnSystemStatusChanged;
+
         if (this.sequenceCompletedHandler != null)
         {
           this.SequenceController.SequenceCompleted -= this.sequenceCompletedHandler;
